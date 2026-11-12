@@ -681,6 +681,7 @@ PUBLIC_PATHS = {
     "/api/accounts",
     "/api/accounts/switch",
     "/api/accounts/remove",
+    "/api/accounts/proxy",
     "/api/settings",
     "/api/polling",
     "/api/polling-mode",
@@ -1063,7 +1064,8 @@ _LUCIDE_ICONS = {
     'activity': '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
     'calendar-check': '<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/><path d="m9 16 2 2 4-4"/>',
     'arrow-left-right': '<path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>',
-    'trash-2': '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
+    'globe': '<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>',
+    'trash-2':'<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
     'log-out': '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>',
     'log-in': '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" x2="3" y1="12" y2="12"/>',
     'refresh-cw': '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
@@ -1457,6 +1459,10 @@ a { color: var(--accent); }
 
 /* Tables */
 .table-wrap { overflow-x: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.proxy-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; background: var(--bg-soft, #f7f8fa); }
+.proxy-editor label { font-size: 12px; font-weight: 600; }
+.proxy-input { flex: 1 1 320px; min-width: 240px; padding: 7px 10px; border: 1px solid var(--line-strong); border-radius: var(--radius); font-family: var(--mono, monospace); font-size: 12px; }
+.proxy-editor-row td { padding: 0 !important; }
 .acct-table, .usage-table, .conn-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .acct-table { min-width: 860px; }
 .acct-table th, .acct-table td, .usage-table th, .usage-table td, .conn-table th, .conn-table td {
@@ -1844,8 +1850,14 @@ def _web_login_html() -> str:
         else:
             checkin_badge = '<span class="badge badge-none">未知</span>'
         valid_flag = "1" if acc.get("is_valid") else "0"
+        proxy_masked = html_mod.escape(acc.get("proxy") or "")
+        proxy_badge = (
+            f'<span class="badge badge-ok" title="{proxy_masked}">代理 {proxy_masked}</span>'
+            if acc.get("has_proxy")
+            else '<span class="badge badge-none">直连</span>'
+        )
         rows += f"""<tr id="row-{aid}" class="{active_row}" data-account-id="{aid}" data-valid="{valid_flag}" data-model-enabled="{'1' if model_enabled else '0'}">
-          <td><div class="acct-cell"><strong id="label-{aid}">{label}</strong><small class="row-subtitle mono">{uid}</small></div></td>
+          <td><div class="acct-cell"><strong id="label-{aid}">{label}</strong><small class="row-subtitle mono">{uid}</small><small class="row-subtitle" id="proxy-state-{aid}">{proxy_badge}</small></div></td>
           <td class="status-cell">{st}{act}</td>
           <td class="muted-cell">{expires}</td>
           <td class="numeric"><span id="general-credits-{aid}" class="credit-value">{credits_text}</span></td>
@@ -1853,8 +1865,20 @@ def _web_login_html() -> str:
           <td class="model-toggle-cell"><div id="model-state-wrap-{aid}" class="model-toggle-state">{model_badge}</div><label class="switch account-model-switch" title="仅控制模型请求，不影响签到"><input type="checkbox" data-action="model-toggle" onchange="markAccountModelDirty('{aid}', this)" aria-label="启用账号模型请求"{model_checked}><span class="track"></span></label></td>
           <td class="row-actions">
             <button class="icon-btn" data-action="checkin" onclick="checkinAccount('{aid}')" title="签到" aria-label="签到">{ic['calendar-check']}</button>
+            <button class="icon-btn" data-action="proxy-edit" onclick="toggleAccountProxyEditor('{aid}')" title="设置出口代理" aria-label="设置出口代理">{ic['globe']}</button>
             <button class="icon-btn" data-action="switch-account" onclick="switchAccount('{aid}')" title="切换为当前账号" aria-label="切换为当前账号"{switch_disabled}>{ic['arrow-left-right']}</button>
             <button class="icon-btn danger" onclick="removeAccount('{aid}')" title="删除账号" aria-label="删除账号">{ic['trash-2']}</button>
+          </td>
+        </tr>
+        <tr id="proxy-editor-row-{aid}" class="proxy-editor-row" style="display:none">
+          <td colspan="7">
+            <div class="proxy-editor">
+              <label for="proxy-input-{aid}">出口代理</label>
+              <input id="proxy-input-{aid}" type="text" class="proxy-input" placeholder="http://user:pass@host:port 或 socks5://host:1080，留空直连" autocomplete="off" />
+              <button class="btn btn-primary btn-sm" id="proxy-save-{aid}" onclick="saveAccountProxy('{aid}')">{ic['save']}保存</button>
+              <button class="btn btn-secondary btn-sm" onclick="clearAccountProxy('{aid}')">清除</button>
+              <small class="row-subtitle">http(s):// 或 socks5(h)://[user:pass@]host:port；保存即生效，无需重启</small>
+            </div>
           </td>
         </tr>"""
     if accounts:
@@ -3820,6 +3844,41 @@ async function switchAccount(id){{
     setActiveAccount(d.active||id,d.account||{{id:id}});
     showMsg('account-msg','已切换到账号 '+String((d.account&&(d.account.label||d.account.user_id))||id),true,3000);
   }}finally{{ setSwitchBusy(false); }}
+}}
+function toggleAccountProxyEditor(id){{
+  var row=document.getElementById('proxy-editor-row-'+id);
+  if(!row) return;
+  row.style.display=row.style.display==='none'?'table-row':'none';
+  if(row.style.display!=='none'){{
+    var input=document.getElementById('proxy-input-'+id);
+    if(input) input.focus();
+  }}
+}}
+async function saveAccountProxy(id){{
+  var input=document.getElementById('proxy-input-'+id);
+  var btn=document.getElementById('proxy-save-'+id);
+  var value=input?input.value.trim():'';
+  if(value&&!/^(https?|socks5h?):\\/\\/\\S+$/.test(value)){{
+    showMsg('account-msg','代理格式应为 http(s):// 或 socks5(h)://[user:pass@]host:port',false);
+    return;
+  }}
+  if(btn) btn.disabled=true;
+  try{{
+    var d=await postJSON('/api/accounts/proxy',{{account_id:id,proxy:value}},30000);
+    if(!d.success){{ showMsg('account-msg',d.error||'保存代理失败',false); return; }}
+    var state=document.getElementById('proxy-state-'+id);
+    if(state){{
+      state.innerHTML=d.has_proxy
+        ? '<span class="badge badge-ok" title="'+escapeHtml(d.proxy)+'">代理 '+escapeHtml(d.proxy)+'</span>'
+        : '<span class="badge badge-none">直连</span>';
+    }}
+    showMsg('account-msg',d.has_proxy?('已保存代理 '+d.proxy+'，立即生效'):'已恢复直连',true,3000);
+  }}finally{{ if(btn) btn.disabled=false; }}
+}}
+async function clearAccountProxy(id){{
+  var input=document.getElementById('proxy-input-'+id);
+  if(input) input.value='';
+  await saveAccountProxy(id);
 }}
 var accountModelDraft={{}};
 function setAccountModelVisual(id,enabled){{
@@ -8632,7 +8691,9 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
         await _await_session_cleanup(cleanup_task)
 
     try:
-        client = httpx.AsyncClient(timeout=60)
+        client = httpx.AsyncClient(
+            timeout=60, **auth.proxy_httpx_kwargs(account_id)
+        )
         session_id, message_id = await trae_client.create_web_session(
             client,
             model,
@@ -8963,7 +9024,9 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         ),
     )
     try:
-        client = httpx.AsyncClient(timeout=None)
+        client = httpx.AsyncClient(
+            timeout=None, **auth.proxy_httpx_kwargs(account_id)
+        )
         logger.info(
             "remote create start id=%s account=%s model=%s messages=%d "
             "input_last_chars=%d query_chars=%d",
@@ -8996,7 +9059,9 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             failed_client = client
             client = None
             await _await_session_cleanup(asyncio.create_task(failed_client.aclose()))
-            client = httpx.AsyncClient(timeout=None)
+            client = httpx.AsyncClient(
+                timeout=None, **auth.proxy_httpx_kwargs(account_id)
+            )
             remote_options = work_fallback_options(remote_options)
             work_fallback_used = True
             mark_work_fallback_trace()
@@ -9207,7 +9272,10 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                 ),
                             )
                             slot_reacquired = True
-                            retry_client = httpx.AsyncClient(timeout=None)
+                            retry_client = httpx.AsyncClient(
+                                timeout=None,
+                                **auth.proxy_httpx_kwargs(retry_account_id),
+                            )
                             logger.info(
                                 "remote empty retry start id=%s model=%s account=%s",
                                 request_id,
@@ -15678,6 +15746,48 @@ async def api_accounts_model_enabled(request: Request):
             "account": account,
             "account_id": account_id,
             "model_enabled": bool(account and account.get("model_enabled", enabled)),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/accounts/proxy")
+async def api_accounts_proxy(request: Request):
+    """Set or clear one account's upstream egress proxy.
+
+    ``proxy`` accepts http(s):// or socks5(h):// URLs with optional
+    credentials; an empty string restores direct connections. The value is
+    persisted to accounts.json and takes effect on the next upstream request
+    without a restart.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"success": False, "error": "JSON body must be an object"}, status_code=400)
+    account_id = str(body.get("account_id") or body.get("id") or "").strip()
+    if not account_id:
+        return JSONResponse({"success": False, "error": "account_id is required"}, status_code=400)
+    proxy = body.get("proxy", "")
+    if not isinstance(proxy, str):
+        return JSONResponse({"success": False, "error": "proxy must be a string"}, status_code=400)
+    try:
+        ok = auth.set_account_proxy(account_id, proxy)
+    except ValueError as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+    if not ok:
+        return JSONResponse({"success": False, "error": "account not found"}, status_code=404)
+    account = next(
+        (item for item in auth.list_accounts() if item.get("id") == account_id), None
+    )
+    return JSONResponse(
+        {
+            "success": True,
+            "account_id": account_id,
+            "proxy": (account or {}).get("proxy", ""),
+            "has_proxy": bool((account or {}).get("has_proxy")),
+            "account": account,
         },
         headers={"Cache-Control": "no-store"},
     )

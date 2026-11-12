@@ -892,7 +892,9 @@ async def _post_checkin(
         raise RuntimeError("No Cloud-IDE-JWT token available")
     base = os.environ.get("TRAE_UG_API_HOST", TRAE_UG_API_HOST).rstrip("/")
     url = f"{base}{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(
+        timeout=30, **auth.proxy_httpx_kwargs(account_id)
+    ) as client:
         resp = await client.post(
             url, json={}, headers=build_checkin_headers(token, account_id)
         )
@@ -945,7 +947,10 @@ async def fetch_account_credits(token: str = "", req_source: int = 1) -> dict:
     base = os.environ.get("TRAE_PAY_API_HOST", TRAE_PAY_API_HOST).rstrip("/")
     url = f"{base}/trae/api/v2/pay/ide_user_ent_usage"
     payload = {"require_usage": True, "req_source": req_source}
-    async with httpx.AsyncClient(timeout=30) as client:
+    account_id = _checkin_identity(token)
+    async with httpx.AsyncClient(
+        timeout=30, **auth.proxy_httpx_kwargs(account_id)
+    ) as client:
         resp = await client.post(url, json=payload, headers=build_checkin_headers(token))
         text = resp.text
         if resp.status_code != 200:
@@ -971,7 +976,9 @@ async def fetch_user_info(token: str = "") -> dict:
     base = os.environ.get("TRAE_UG_API_HOST", TRAE_UG_API_HOST).rstrip("/")
     url = f"{base}/cloudide/api/v3/trae/GetUserInfo"
     headers = {"Content-Type": "application/json", "x-cloudide-token": token}
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(
+        timeout=20, **auth.proxy_httpx_kwargs(_checkin_identity(token))
+    ) as client:
         resp = await client.post(url, json={"ReqSource": "IDE"}, headers=headers)
         text = resp.text
         if resp.status_code != 200:
@@ -1254,7 +1261,9 @@ async def fetch_session_usage(
     }
     timeout = float(os.environ.get("TRAE_USAGE_QUERY_TIMEOUT_SECONDS", "15") or "15")
     timeout = max(1.0, min(timeout, 60.0))
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout, **auth.proxy_httpx_kwargs(_checkin_identity(token))
+    ) as client:
         response = await client.post(
             url,
             json={"session_id": session_id},
@@ -2053,7 +2062,9 @@ async def _fetch_web_model_configs(
             else None
         )
         async with httpx.AsyncClient(
-            headers=build_web_headers(token, header_options), timeout=30
+            headers=build_web_headers(token, header_options),
+            timeout=30,
+            **auth.proxy_httpx_kwargs(_checkin_identity(token)),
         ) as client:
             resp = await client.get(url)
             if resp.status_code != 200:
@@ -2291,7 +2302,9 @@ async def _fetch_solo_model_configs(
             os.environ.get("TRAE_SOLO_MODEL_LIST_TIMEOUT_SECONDS", "8") or "8"
         )
         timeout = max(1.0, min(timeout, 20.0))
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout, **auth.proxy_httpx_kwargs(_checkin_identity(token))
+        ) as client:
             resp = await client.post(url, headers=headers, json=body)
             if resp.status_code != 200:
                 logger.warning(
@@ -3347,8 +3360,7 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
     )
     if not bound_token and not bound_account_id:
         # The legacy unbound path may refresh the selected account.  Never
-        # refresh here when a caller supplied a lease account: refresh_token()
-        # operates on global auth and could replace a different account's
+        # refresh here when a caller supplied a lease account: refresh_token()        # operates on global auth and could replace a different account's
         # credential mid-request.
         await auth_module.maybe_refresh()
         bound_token = str(auth.get_token() or "").strip()
@@ -3626,6 +3638,7 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
                 headers=endpoint_headers,
                 timeout=timeout,
                 http2=False,
+                **auth.proxy_httpx_kwargs(bound_account_id),
             )
             returned_response = False
             try:

@@ -25,3 +25,10 @@
 - socks5 需要 `socksio`，requirements 加 `httpx[socks]`。
 - 面板行内编辑 + `/api/accounts/proxy` 端点，保存即生效（客户端每次调用新建，无缓存失效问题）；`/api/accounts` 列表只暴露脱敏 proxy 显示串。
 - 新增 `docs/FEATURES.md` 汇总两功能说明与验证步骤。
+
+## 验证记录
+- `pytest tests/test_checkin_schedule.py`：9 passed（窗口边界/间隔/压缩 warning/重启复用/跨天重生成/到点触发/冷却挂起/已签到跳过/计划新增账号）。
+- `pytest tests/test_account_proxy.py`：21 passed（校验/脱敏/持久化/API/httpx 出口 kwargs）。
+- 全量 `pytest tests/`：1247 passed, 6 skipped（Windows 专用），无回归。
+- 真实出口验证：本地 toy HTTP 代理 + 源站，直连账号 proxy 命中 0 次、配置代理账号经代理转发成功（hits origin=2/proxy=1）。
+- 环境注意：本机仓库 main.py/auth.py/raw_client.py 为 CRLF，已统一 LF；测试环境 Alpine 需 `pip install fastapi 'httpx[socks]' python-dotenv uvicorn`。

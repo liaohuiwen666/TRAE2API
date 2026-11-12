@@ -397,7 +397,9 @@ async def refresh_token() -> bool:
             "UserID": user_id,
         }
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(
+            timeout=30, **proxy_httpx_kwargs(captured_account_id)
+        ) as client:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
             data = resp.json()
@@ -527,7 +529,9 @@ async def refresh_account(account_id: str) -> bool:
             "ClientSecret": "-",
             "UserID": user_id,
         }
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(
+            timeout=30, **proxy_httpx_kwargs(account_id)
+        ) as client:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
             data = resp.json()
@@ -997,6 +1001,96 @@ def set_account_model_enabled(account_id: str, enabled: bool) -> bool:
         rec["model_enabled"] = bool(enabled)
         _save_accounts()
         return True
+
+
+# ---------------------------------------------------------------------------
+# Per-account upstream egress proxy (feature two).
+#
+# ``accounts.json`` records may carry an optional ``proxy`` field
+# (``http://[user:pass@]host:port`` or ``socks5://[user:pass@]host:port``).
+# An absent/empty value keeps the original direct-connection behavior.
+# ---------------------------------------------------------------------------
+from urllib.parse import urlsplit as _urlsplit
+
+_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
+
+
+def validate_account_proxy(value) -> str:
+    """Normalize a proxy URL, raising ValueError for malformed input."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = _urlsplit(text)
+    except ValueError as exc:
+        raise ValueError(f"invalid proxy URL: {exc}") from exc
+    scheme = (parts.scheme or "").lower()
+    if scheme not in _PROXY_SCHEMES:
+        raise ValueError(
+            "proxy scheme must be http, https, socks5 or socks5h"
+        )
+    if not parts.hostname:
+        raise ValueError("proxy URL must include a host")
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("proxy URL has an invalid port") from exc
+    if port is not None and not (1 <= port <= 65535):
+        raise ValueError("proxy port must be between 1 and 65535")
+    return text
+
+
+def mask_account_proxy(value) -> str:
+    """Return a display-safe proxy string without credentials."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = _urlsplit(text)
+    except ValueError:
+        return "invalid"
+    host = parts.hostname or ""
+    port = parts.port
+    suffix = f":{port}" if port else ""
+    auth_mark = "***@" if parts.username else ""
+    return f"{parts.scheme}://{auth_mark}{host}{suffix}"
+
+
+def get_account_proxy(account_id: str) -> str:
+    """Return the configured upstream proxy URL for an account, or ''."""
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return ""
+    rec = get_account_record(account_id)
+    proxy = str(rec.get("proxy") or "").strip()
+    if not proxy:
+        return ""
+    try:
+        return validate_account_proxy(proxy)
+    except ValueError:
+        logger.warning("auth: account=%s has invalid proxy, using direct", account_id)
+        return ""
+
+
+def set_account_proxy(account_id: str, proxy) -> bool:
+    """Persist (or clear) one account's upstream proxy, effective immediately."""
+    normalized = validate_account_proxy(proxy)
+    with _STORE_LOCK:
+        rec = _accounts.get(str(account_id or ""))
+        if rec is None:
+            return False
+        if normalized:
+            rec["proxy"] = normalized
+        else:
+            rec.pop("proxy", None)
+        _save_accounts()
+        return True
+
+
+def proxy_httpx_kwargs(account_id: str) -> dict:
+    """httpx client kwargs for an account: {} when direct (original behavior)."""
+    proxy = get_account_proxy(account_id)
+    return {"proxy": proxy} if proxy else {}
 
 
 def set_account_checkin(account_id: str, data: dict) -> None:
@@ -1704,6 +1798,8 @@ def list_accounts() -> list[dict]:
                 'user_id': rec.get('user_id', aid),
                 'label': rec.get('label', ''),
                 'source': rec.get('source', ''),
+                'proxy': mask_account_proxy(rec.get('proxy', '')),
+                'has_proxy': bool(str(rec.get('proxy') or '').strip()),
                 'has_token': bool(rec.get('token')),
                 'is_active': aid == _active_account,
                 'is_valid': _record_valid(rec),

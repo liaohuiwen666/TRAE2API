@@ -1505,7 +1505,11 @@ async def send_traecode_chat_request(
         response: Optional[httpx.Response] = None
         detail = ""
         try:
-            client = httpx.Client(timeout=timeout, http2=False)
+            client = httpx.Client(
+                timeout=timeout,
+                http2=False,
+                **auth.proxy_httpx_kwargs(str(options.get("_account_id") or "")),
+            )
             for base_url in base_urls:
                 request_headers = headers
                 if base_url != base_urls[0]:
@@ -3295,7 +3299,11 @@ async def send_raw_chat_request(
         client: Optional[httpx.Client] = None
         response: Optional[httpx.Response] = None
         try:
-            client = httpx.Client(timeout=timeout, http2=False)
+            client = httpx.Client(
+                timeout=timeout,
+                http2=False,
+                **auth.proxy_httpx_kwargs(str(options.get("_account_id") or "")),
+            )
             request = client.build_request(
                 "POST",
                 base_url
