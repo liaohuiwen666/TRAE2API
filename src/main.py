@@ -262,6 +262,14 @@ CHECKIN_9074_BACKOFF_EXPONENT_CAP = max(
 CHECKIN_AUTO_RETRY_INTERVAL = float(
     os.environ.get("TRAE_CHECKIN_AUTO_RETRY_INTERVAL_SECONDS", "60") or "60"
 )
+# Daily randomized check-in schedule (feature: spread accounts over a window).
+# The existing fixed-time auto checkin above stays independent and unchanged.
+CHECKIN_WINDOW_START = os.environ.get("TRAE_CHECKIN_WINDOW_START", "06:00") or "06:00"
+CHECKIN_WINDOW_END = os.environ.get("TRAE_CHECKIN_WINDOW_END", "21:00") or "21:00"
+CHECKIN_MIN_GAP_SECONDS = float(
+    os.environ.get("TRAE_CHECKIN_MIN_GAP_SECONDS", "600") or "600"
+)
+CHECKIN_PLAN_PATH = auth.ACCOUNTS_PATH.parent / "checkin_plan.json"
 DEFAULT_REMOTE_BASE_URL = "https://trae-api-cn.mchost.guru/api/remote/v1"
 DEFAULT_WORK_MODEL_GATEWAY_URL = (
     os.environ.get("TRAE_WORK_BASE_URL")
@@ -683,6 +691,7 @@ PUBLIC_PATHS = {
     "/api/enterprise",
     "/api/auto-checkin",
     "/api/auto-checkin/run",
+    "/api/checkin/schedule",
     "/api/checkin/status",
     "/api/checkin/claim",
     "/api/checkin/accounts",
@@ -2270,6 +2279,10 @@ def _web_login_html() -> str:
     <div><dt>上次结果</dt><dd id="auto-checkin-result">-</dd></div>
   </dl>
   <div id="auto-checkin-msg" class="msg" role="status" aria-live="polite"></div>
+  <details class="manual-add" id="checkin-schedule-details">
+    <summary>今日随机签到计划<span id="checkin-schedule-meta" class="section-meta"></span></summary>
+    <div id="checkin-schedule-body" class="usage-records-container">加载中...</div>
+  </details>
 </section>
 </div>
 </div>
@@ -4407,6 +4420,26 @@ async function runAutoCheckinNow(){{
 }}
 loadAutoCheckin();
 setInterval(loadAutoCheckin,60000);
+async function loadCheckinSchedule(){{
+  try{{
+    var result=await requestJSON('/api/checkin/schedule',{{method:'GET'}},15000);
+    var d=result.data||{{}};
+    var body=document.getElementById('checkin-schedule-body');
+    var meta=document.getElementById('checkin-schedule-meta');
+    if(!body) return;
+    var entries=d.entries||[];
+    if(meta) meta.textContent=' '+d.date+' '+d.window_start+'-'+d.window_end+' · 最小间隔 '+Math.round(d.effective_gap_seconds||0)+'s';
+    if(!entries.length){{ body.textContent='暂无账号'; return; }}
+    var html='<table class="usage-table"><thead><tr><th>账号</th><th>计划时间</th><th>状态</th></tr></thead><tbody>';
+    entries.forEach(function(e){{
+      var state=e.done?(e.result==='ok'?'已签到':(e.result==='skipped'?'已跳过':(e.result||'失败'))):'待执行';
+      html+='<tr><td>'+escapeHtml(String(e.label||e.account_id||''))+'</td><td>'+escapeHtml(String(e.time||''))+'</td><td>'+escapeHtml(state)+'</td></tr>';
+    }});
+    body.innerHTML=html+'</tbody></table>';
+  }}catch(e){{}}
+}}
+loadCheckinSchedule();
+setInterval(loadCheckinSchedule,60000);
 (function(){{
   var initial=(location.hash||'').replace('#','');
   if(initial&&document.querySelector('.tab-page[data-page="'+initial+'"]')) switchTab(initial);
@@ -13588,6 +13621,214 @@ async def _auto_checkin_loop():
             logger.warning("auto checkin loop error: %s", exc)
 
 
+# ---------------------------------------------------------------------------
+# Randomized daily check-in schedule (feature one).
+#
+# Every account gets one random claim time inside the configured window; any
+# two times differ by at least the effective minimum gap. The plan is stored
+# in data/checkin_plan.json so a container restart resumes today's remaining
+# entries instead of re-randomizing. Claims run through the existing
+# _claim_checkin_account path, inheriting its 9074 backoff, device rotation
+# and already-checked-in skipping unchanged.
+# ---------------------------------------------------------------------------
+CHECKIN_SCHEDULE_POLL_SECONDS = 30.0
+_CHECKIN_PLAN_LOCK = threading.Lock()
+_CHECKIN_PLAN_CACHE: dict | None = None
+
+
+def _checkin_window_minutes() -> tuple[int, int]:
+    """Parse the HH:MM window, falling back to 06:00-21:00 on bad input."""
+
+    def _parse(text: str, fallback: int) -> int:
+        try:
+            hour, minute = (int(part) for part in str(text).strip().split(":", 1))
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return hour * 60 + minute
+        except (ValueError, TypeError):
+            pass
+        logger.warning("checkin schedule: invalid window time %r, using default", text)
+        return fallback
+
+    return _parse(CHECKIN_WINDOW_START, 6 * 60), _parse(CHECKIN_WINDOW_END, 21 * 60)
+
+
+def _build_checkin_plan(account_ids: list[str], now: Optional[datetime] = None) -> dict:
+    """Create today's random schedule with pairwise gaps >= effective gap."""
+    current = now or datetime.now(_CHECKIN_TIMEZONE)
+    start_min, end_min = _checkin_window_minutes()
+    window_seconds = max(0, (end_min - start_min) * 60)
+    count = len(account_ids)
+    min_gap = max(0.0, float(CHECKIN_MIN_GAP_SECONDS))
+    if count > 1 and window_seconds and (count - 1) * min_gap > window_seconds:
+        effective_gap = window_seconds / (count - 1)
+        logger.warning(
+            "checkin schedule: %d accounts x %.0fs min gap do not fit the %ds window; "
+            "compressed gap to %.1fs",
+            count,
+            min_gap,
+            window_seconds,
+            effective_gap,
+        )
+    else:
+        effective_gap = min_gap
+    entries: list[dict] = []
+    if count:
+        slack = max(0.0, window_seconds - (count - 1) * effective_gap)
+        # Distribute leftover window space as random jitter around the evenly
+        # spaced base offsets so every pair stays >= effective_gap apart.
+        weights = [secrets.SystemRandom().random() for _ in range(count + 1)]
+        total_weight = sum(weights) or 1.0
+        base = current.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        base += start_min * 60
+        offsets = [0.0]
+        for idx in range(count):
+            offsets.append(offsets[-1] + weights[idx] / total_weight * slack)
+            if idx < count - 1:
+                offsets[-1] += effective_gap
+        ordered_ids = list(account_ids)
+        secrets.SystemRandom().shuffle(ordered_ids)
+        for aid, offset in zip(ordered_ids, offsets):
+            entries.append(
+                {
+                    "account_id": aid,
+                    "at": base + offset,
+                    "time": datetime.fromtimestamp(
+                        base + offset, _CHECKIN_TIMEZONE
+                    ).strftime("%H:%M:%S"),
+                }
+            )
+        entries.sort(key=lambda item: item["at"])
+    return {
+        "date": current.date().isoformat(),
+        "window_start": CHECKIN_WINDOW_START,
+        "window_end": CHECKIN_WINDOW_END,
+        "min_gap_seconds": min_gap,
+        "effective_gap_seconds": effective_gap,
+        "entries": entries,
+    }
+
+
+def _checkin_plan_file() -> Path:
+    return Path(os.environ.get("TRAE_CHECKIN_PLAN_FILE") or CHECKIN_PLAN_PATH)
+
+
+def _load_checkin_plan() -> dict | None:
+    path = _checkin_plan_file()
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning("checkin schedule: could not read %s: %s", path, exc)
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        return None
+    return data
+
+
+def _save_checkin_plan(plan: dict) -> None:
+    path = _checkin_plan_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(plan, ensure_ascii=False, indent=2), "utf-8")
+        tmp.replace(path)
+    except Exception as exc:
+        logger.warning("checkin schedule: could not save %s: %s", path, exc)
+
+
+def _checkin_today_plan(now: Optional[datetime] = None) -> dict:
+    """Return today's plan, regenerating only when missing or stale."""
+    global _CHECKIN_PLAN_CACHE
+    current = now or datetime.now(_CHECKIN_TIMEZONE)
+    today = current.date().isoformat()
+    with _CHECKIN_PLAN_LOCK:
+        plan = _CHECKIN_PLAN_CACHE
+        if not plan or plan.get("date") != today:
+            plan = _load_checkin_plan()
+        if not plan or plan.get("date") != today:
+            plan = _build_checkin_plan(
+                [aid for aid, _ in auth.get_accounts_raw()], current
+            )
+            _save_checkin_plan(plan)
+            logger.info(
+                "checkin schedule: generated %d entries for %s (%s-%s, gap %.0fs)",
+                len(plan["entries"]),
+                today,
+                plan["window_start"],
+                plan["window_end"],
+                plan["effective_gap_seconds"],
+            )
+        # Accounts added after plan creation join today's schedule once.
+        known = {str(item.get("account_id")) for item in plan["entries"]}
+        missing = [aid for aid, _ in auth.get_accounts_raw() if aid not in known]
+        if missing:
+            plan = _build_checkin_plan(
+                [aid for aid, _ in auth.get_accounts_raw()], current
+            )
+            _save_checkin_plan(plan)
+        _CHECKIN_PLAN_CACHE = plan
+        return plan
+
+
+async def _checkin_schedule_cycle() -> None:
+    """One scheduler pass: claim every due, unfinished entry of today's plan."""
+    plan = _checkin_today_plan()
+    now_ts = time.time()
+    dirty = False
+    for entry in plan["entries"]:
+        if entry.get("done") or float(entry.get("at") or 0) > now_ts:
+            continue
+        account_id = str(entry.get("account_id") or "")
+        if not account_id:
+            continue
+        # Respect the account's own 9074 cooldown: leave the entry pending;
+        # the existing background retry loop owns retries.
+        if _checkin_cooldown_remaining(account_id):
+            continue
+        # Accounts already checked in today are marked done without sending
+        # another claim.
+        try:
+            record = auth.get_account_record(account_id)
+            if (record.get("checkin") or {}).get("checked_in") is True and (
+                _checkin_cache_is_today(record)
+            ):
+                entry["done"] = True
+                entry["result"] = "skipped"
+                dirty = True
+                continue
+            result = await _claim_checkin_account(account_id)
+            entry["done"] = True
+            entry["result"] = "ok" if result.get("success") else "failed"
+            dirty = True
+            logger.info(
+                "checkin schedule: account=%s planned=%s result=%s",
+                account_id,
+                entry.get("time"),
+                entry["result"],
+            )
+        except Exception as exc:
+            entry["done"] = True
+            entry["result"] = f"error: {exc}"[:200]
+            dirty = True
+            logger.warning(
+                "checkin schedule: account=%s error: %s", account_id, exc
+            )
+    if dirty:
+        with _CHECKIN_PLAN_LOCK:
+            _save_checkin_plan(plan)
+
+
+async def _checkin_schedule_loop():
+    """Fire today's planned claims; finished entries are marked done on disk."""
+    while True:
+        await asyncio.sleep(CHECKIN_SCHEDULE_POLL_SECONDS)
+        try:
+            await _checkin_schedule_cycle()
+        except Exception as exc:
+            logger.warning("checkin schedule loop error: %s", exc)
+
+
 def _auto_checkin_payload() -> dict:
     settings = auth.get_auto_checkin_settings()
     next_run = _auto_checkin_next_run(settings)
@@ -13608,6 +13849,32 @@ def _auto_checkin_payload() -> dict:
     }
 
 
+def _checkin_schedule_payload() -> dict:
+    plan = _checkin_today_plan()
+    labels = {
+        aid: (rec.get("label") or rec.get("user_id") or aid)
+        for aid, rec in auth.get_accounts_raw()
+    }
+    return {
+        "success": True,
+        "date": plan.get("date"),
+        "window_start": plan.get("window_start"),
+        "window_end": plan.get("window_end"),
+        "min_gap_seconds": plan.get("min_gap_seconds"),
+        "effective_gap_seconds": plan.get("effective_gap_seconds"),
+        "entries": [
+            {
+                "account_id": item.get("account_id"),
+                "label": labels.get(str(item.get("account_id")), item.get("account_id")),
+                "time": item.get("time"),
+                "done": bool(item.get("done")),
+                "result": item.get("result") or "",
+            }
+            for item in plan.get("entries", [])
+        ],
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_app()
@@ -13615,6 +13882,7 @@ async def lifespan(app: FastAPI):
     terminal_reaper = asyncio.create_task(_terminal_session_reaper_loop())
     checkin_retry = asyncio.create_task(_checkin_auto_retry_loop())
     auto_checkin = asyncio.create_task(_auto_checkin_loop())
+    checkin_schedule = asyncio.create_task(_checkin_schedule_loop())
     usage_enrichment = asyncio.create_task(_usage_enrichment_loop())
     credit_reconcile = asyncio.create_task(_credit_reconcile_loop())
     try:
@@ -13625,6 +13893,7 @@ async def lifespan(app: FastAPI):
             terminal_reaper,
             checkin_retry,
             auto_checkin,
+            checkin_schedule,
             usage_enrichment,
             credit_reconcile,
         ):
@@ -13634,6 +13903,7 @@ async def lifespan(app: FastAPI):
             terminal_reaper,
             checkin_retry,
             auto_checkin,
+            checkin_schedule,
             usage_enrichment,
             credit_reconcile,
             return_exceptions=True,
@@ -15754,6 +16024,11 @@ async def api_set_auto_route(request: Request):
 @app.get("/api/auto-checkin")
 async def api_get_auto_checkin():
     return JSONResponse(_auto_checkin_payload(), headers={"Cache-Control": "no-store"})
+
+@app.get("/api/checkin/schedule")
+async def api_get_checkin_schedule():
+    """Today's randomized per-account check-in schedule (read-only)."""
+    return JSONResponse(_checkin_schedule_payload(), headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/auto-checkin")

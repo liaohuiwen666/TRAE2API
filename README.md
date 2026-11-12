@@ -179,6 +179,9 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_CHECKIN_9074_RETRY_SECONDS` | `60` | 上游返回业务码 9074 后提示的最短重试等待时间；relay 不会立即重复 claim |
 | `TRAE_CHECKIN_9074_MAX_BACKOFF_SECONDS` | `3600` | 连续 9074 指数退避的等待上限（秒） |
 | `TRAE_CHECKIN_AUTO_RETRY_INTERVAL_SECONDS` | `60` | 后台自动错峰重试的扫描间隔（秒），到点自动 claim 冷却到期的账号 |
+| `TRAE_CHECKIN_WINDOW_START` | `06:00` | 随机签到窗口开始（北京时间）；每天窗口内给每个账号分配一个随机签到时间点 |
+| `TRAE_CHECKIN_WINDOW_END` | `21:00` | 随机签到窗口结束（北京时间） |
+| `TRAE_CHECKIN_MIN_GAP_SECONDS` | `600` | 任意两个账号随机签到时间点的最小间隔；窗口装不下时自动压缩并写 warning 日志 |
 | `TRAE_RAW_BASE_URL` | `https://trae-api-cn.mchost.guru` | 企业 Raw v2 地址；个人账号缺企业 app config 时会返回 `2001 record not found` |
 | `TRAE_RAW_MAX_MESSAGES` | `80` | raw 请求保留的非系统历史消息上限；会保留最近连续历史及边界工具调用配对 |
 | `TRAE_RAW_MAX_HISTORY_CHARS` | `120000` | raw 历史文本字符上限，避免重复工具 schema 和过长历史造成额外消费 |

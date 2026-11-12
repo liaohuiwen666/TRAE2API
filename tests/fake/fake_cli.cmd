@@ -1,2 +1,2 @@
-@echo off
-python "%~dp0fake_cli.py" %*
+#!/bin/sh
+exec "/usr/bin/python3" "/var/minis/workspace/Trae2api-cn/tests/fake/fake_cli.py" "$@"
