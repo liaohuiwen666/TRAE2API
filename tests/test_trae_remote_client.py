@@ -236,7 +236,7 @@ class RemoteClientTests(unittest.TestCase):
         (session, (url, request)) = asyncio.run(run())
         self.assertEqual(session, ("s1", "m1"))
         self.assertTrue(url.endswith("/chat_sessions"))
-        self.assertEqual(request["headers"]["Authorization"], "Cloud-IDE-JWT jwt-token")
+        self.assertEqual(request["headers"]["authorization"], "Cloud-IDE-JWT jwt-token")
         body = request["json"]
         self.assertEqual(body["initial_message"]["agent_type"], "solo_agent_remote")
         self.assertEqual(body["initial_message"]["agent_id"], "solo_agent_remote")
@@ -765,8 +765,38 @@ class RemoteClientTests(unittest.TestCase):
                 "jwt-token", options={"provider_specific": {}}, stream=False
             )
 
-        self.assertEqual(headers["X-Preferenced-Language"], "zh-CN")
+        self.assertEqual(headers["x-preferenced-language"], "zh-cn")
         self.assertEqual(headers["x-user-region"], "CN")
+
+    def test_build_headers_mirrors_real_browser_client_hints(self):
+        """Header hygiene (1.3.0.2): the web client captured in a browser
+        sends lowercase names plus sec-ch-ua/fetch hints, accept-language,
+        priority and timezone; the streaming GET carries no Content-Type
+        while POSTs do. sec-ch-ua says 152 to match this relay's TLS
+        fingerprint, not the operator's newer browser."""
+        stream_headers = trae_remote_client.build_headers(
+            "jwt-token", options={}, stream=True
+        )
+        post_headers = trae_remote_client.build_headers(
+            "jwt-token", options={}, stream=False
+        )
+        for headers in (stream_headers, post_headers):
+            self.assertEqual(headers["accept-language"], "zh-CN,zh;q=0.9,en;q=0.8")
+            self.assertEqual(headers["priority"], "u=1, i")
+            self.assertIn('Chromium";v="152"', headers["sec-ch-ua"])
+            self.assertIn('Google Chrome";v="152"', headers["sec-ch-ua"])
+            self.assertEqual(headers["sec-ch-ua-mobile"], "?0")
+            self.assertEqual(headers["sec-ch-ua-platform"], '"Windows"')
+            self.assertEqual(headers["sec-fetch-dest"], "empty")
+            self.assertEqual(headers["sec-fetch-mode"], "cors")
+            self.assertEqual(headers["sec-fetch-site"], "cross-site")
+            self.assertEqual(headers["x-trae-user-timezone"], "Asia/Shanghai")
+            self.assertEqual(headers["x-trae-client-type"], "web")
+            self.assertIn("Chrome/152.0.0.0", headers["user-agent"])
+        self.assertEqual(stream_headers["accept"], "text/event-stream")
+        self.assertNotIn("content-type", stream_headers)
+        self.assertEqual(post_headers["accept"], "application/json")
+        self.assertEqual(post_headers["content-type"], "application/json")
 
     def test_work_billing_overlay_is_opt_in_and_injects_wire_fields(self):
         async def run():
@@ -803,7 +833,7 @@ class RemoteClientTests(unittest.TestCase):
         self.assertEqual(session, ("s1", "m1"))
         self.assertTrue(url.endswith("/chat_sessions"))
         headers = request["headers"]
-        self.assertEqual(headers["X-Trae-Client-Type"], "lite")
+        self.assertEqual(headers["x-trae-client-type"], "lite")
         self.assertEqual(headers["request-traffic-type"], "prod")
         self.assertEqual(headers["x-trae-work"], "1")
         self.assertEqual(headers["x-bridge-transport"], "aha")
@@ -868,7 +898,7 @@ class RemoteClientTests(unittest.TestCase):
 
         (_url, request) = asyncio.run(run())
         headers = request["headers"]
-        self.assertEqual(headers["X-Trae-Client-Type"], "web")
+        self.assertEqual(headers["x-trae-client-type"], "web")
         self.assertNotIn("x-trae-work", headers)
         body = request["json"]
         self.assertEqual(body["origin"], "web")
@@ -915,7 +945,7 @@ class RemoteClientTests(unittest.TestCase):
             return client.posts[0]
 
         (_url, request) = asyncio.run(run())
-        self.assertEqual(request["headers"]["X-Trae-Client-Type"], "lite")
+        self.assertEqual(request["headers"]["x-trae-client-type"], "lite")
         self.assertNotIn("x-trae-work", request["headers"])
         body = request["json"]
         self.assertEqual(body["origin"], "web")
@@ -2523,7 +2553,7 @@ class RemoteClientTests(unittest.TestCase):
             self.assertIn("trae-api-cn", trae_remote_client.base_url())
             headers = trae_remote_client.build_headers("jwt")
         self.assertEqual(headers["x-user-region"], "CN")
-        self.assertIn("solo.trae.cn", headers["Referer"])
+        self.assertIn("solo.trae.cn", headers["referer"])
 
     def test_bare_trae_host_is_repaired_with_remote_path(self):
         """A host-only base must not 404 every chat_sessions/models call (#9)."""

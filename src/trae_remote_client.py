@@ -360,28 +360,52 @@ def build_headers(
     region_default = "US" if intl else "CN"
     origin_default = "https://solo.trae.ai" if intl else DEFAULT_ORIGIN
     origin = os.environ.get("TRAE_WEB_ORIGIN") or origin_default
+    language = str(
+        _psd_value(psd, "appLanguage")
+        or os.environ.get("TRAE_WEB_LANGUAGE")
+        or language_default
+    )
+    # The real web client sends the language lowercase ("zh-cn").
+    if language.lower() == "zh-cn":
+        language = "zh-cn"
     headers = {
-        "Authorization": f"Cloud-IDE-JWT {token}",
-        "Content-Type": "application/json",
-        "X-Trae-Client-Type": os.environ.get("TRAE_WEB_CLIENT_TYPE", "web"),
-        "X-Preferenced-Language": str(
-            _psd_value(psd, "appLanguage") or os.environ.get("TRAE_WEB_LANGUAGE") or language_default
-        ),
+        # Header names are lowercase, as a real browser sends them over
+        # HTTP/2, in the order the web client lists them. The relay
+        # requests the mchost.guru gateway cross-origin, so sec-fetch-site
+        # is "cross-site" (the captured same-origin value came from a
+        # work.trae.cn -> work.trae.cn request). No Content-Type on the
+        # streaming GET: a real browser sends none without a body.
+        # x-user-region is kept even though the captured client does not
+        # send it: the gateway may route on it.
+        "accept": "text/event-stream" if stream else "application/json",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "authorization": f"Cloud-IDE-JWT {token}",
+        "origin": origin,
+        "priority": "u=1, i",
+        "referer": origin.rstrip("/") + "/",
+        "sec-ch-ua": trae_client.WEB_SEC_CH_UA,
+        "sec-ch-ua-mobile": trae_client.WEB_SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": trae_client.WEB_SEC_CH_UA_PLATFORM,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "cross-site",
+        "user-agent": DEFAULT_USER_AGENT,
+        "x-preferenced-language": language,
+        "x-trae-client-type": os.environ.get("TRAE_WEB_CLIENT_TYPE", "web"),
+        "x-trae-user-timezone": "Asia/Shanghai",
         "x-user-region": str(
             _psd_value(psd, "userRegion") or os.environ.get("TRAE_WEB_USER_REGION") or region_default
         ),
-        "Origin": origin,
-        "Referer": origin.rstrip("/") + "/",
-        "User-Agent": DEFAULT_USER_AGENT,
-        "Accept": "text/event-stream" if stream else "application/json",
     }
+    if not stream:
+        headers["content-type"] = "application/json"
     overlay = _work_billing_overlay(options)
     if _work_client_type_enabled(options):
-        headers["X-Trae-Client-Type"] = "lite"
+        headers["x-trae-client-type"] = "lite"
     if overlay:
         client_type = overlay.get("client_type")
         if client_type not in (None, ""):
-            headers["X-Trae-Client-Type"] = str(client_type)
+            headers["x-trae-client-type"] = str(client_type)
         traffic_type = overlay.get("traffic_type")
         if traffic_type not in (None, ""):
             headers["request-traffic-type"] = str(traffic_type)

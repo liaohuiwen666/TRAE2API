@@ -173,7 +173,7 @@ class TraeWorkCompatTests(unittest.TestCase):
         self.assertEqual(initial["model_selection_strategy"], "auto")
         self.assertEqual(initial["model_name"], "")
         self.assertNotIn("custom_model", initial)
-        self.assertEqual(descriptor.headers["Authorization"], "Cloud-IDE-JWT jwt-token")
+        self.assertEqual(descriptor.headers["authorization"], "Cloud-IDE-JWT jwt-token")
         self.assertEqual(descriptor.headers["X-Request-Id"], descriptor.ids.request_id)
 
     def test_build_remote_session_request_uses_manual_binding_for_explicit_model(self):

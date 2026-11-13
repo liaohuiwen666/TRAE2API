@@ -1400,28 +1400,62 @@ def _provider_specific(options: Optional[Mapping[str, Any]] = None) -> dict[str,
     return auth.get_psd()
 
 
+# Browser client hints the web client presents. These must agree with the
+# curl_cffi impersonation profile (JA4-verified Chrome 152), not with the
+# operator's own browser: a real web client captured on work.trae.cn sent
+# Chromium 156 because that browser was 156; this relay's TLS fingerprint
+# is 152, so the UA and sec-ch-ua both say 152.
+WEB_SEC_CH_UA = '"Not:A-Brand";v="8", "Chromium";v="152", "Google Chrome";v="152"'
+WEB_SEC_CH_UA_MOBILE = "?0"
+WEB_SEC_CH_UA_PLATFORM = '"Windows"'
+
+
 def build_web_headers(
-    token: str, options: Optional[Mapping[str, Any]] = None
+    token: str, options: Optional[Mapping[str, Any]] = None,
+    stream: bool = False,
 ) -> dict[str, str]:
-    """构造参考 OmniRoute 网页版 remote 会话的请求头。"""
+    """构造参考 OmniRoute 网页版 remote 会话的请求头。
+
+    Header set mirrors the real web client (captured from a browser on
+    work.trae.cn): lowercase names, sec-ch-ua/fetch hints, accept-language,
+    priority and timezone. ``stream`` marks the events GET, which carries
+    no body and therefore no Content-Type.
+    """
     psd = _provider_specific(options)
-    return {
-        "Authorization": f"Cloud-IDE-JWT {token}",
-        "Content-Type": "application/json",
-        "X-Trae-Client-Type": "web",
-        "X-Preferenced-Language": psd.get("appLanguage")
+    language = (
+        psd.get("appLanguage")
         or os.environ.get("TRAE_WEB_LANGUAGE")
-        or "zh-CN",
-        "x-user-region": psd.get("userRegion")
-        or os.environ.get("TRAE_WEB_USER_REGION")
-        or "CN",
-        "Origin": web_origin(),
-        "Referer": web_origin() + "/",
-        "User-Agent": (
+        or "zh-CN"
+    )
+    if str(language).lower() == "zh-cn":
+        language = "zh-cn"
+    headers = {
+        "accept": "text/event-stream" if stream else "application/json",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "authorization": f"Cloud-IDE-JWT {token}",
+        "origin": web_origin(),
+        "priority": "u=1, i",
+        "referer": web_origin() + "/",
+        "sec-ch-ua": WEB_SEC_CH_UA,
+        "sec-ch-ua-mobile": WEB_SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": WEB_SEC_CH_UA_PLATFORM,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "cross-site",
+        "user-agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
         ),
+        "x-preferenced-language": language,
+        "x-trae-client-type": "web",
+        "x-trae-user-timezone": "Asia/Shanghai",
+        "x-user-region": psd.get("userRegion")
+        or os.environ.get("TRAE_WEB_USER_REGION")
+        or "CN",
     }
+    if not stream:
+        headers["content-type"] = "application/json"
+    return headers
 
 
 REMOTE_BASE_DEFAULT = "https://trae-api-cn.mchost.guru/api/remote/v1"
@@ -2853,7 +2887,7 @@ async def stream_web_events(
     token = str(options.get("_auth_token") or auth.get_token() or "")
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
     async with client.stream(
-        "GET", url, headers=build_web_headers(token, options), timeout=timeout
+        "GET", url, headers=build_web_headers(token, options, stream=True), timeout=timeout
     ) as resp:
         if resp.status_code != 200:
             body = await resp.aread()

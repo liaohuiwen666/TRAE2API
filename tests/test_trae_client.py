@@ -772,7 +772,7 @@ class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(common["web_id"], "bound-web")
         self.assertEqual(common["biz_user_id"], "bound-biz")
-        self.assertEqual(fake_client.request["headers"]["X-Preferenced-Language"], "ja-JP")
+        self.assertEqual(fake_client.request["headers"]["x-preferenced-language"], "ja-JP")
         self.assertEqual(fake_client.request["headers"]["x-user-region"], "JP")
 
     def test_web_headers_preserve_bound_empty_provider_metadata(self):
@@ -785,7 +785,7 @@ class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
                 "token", {"provider_specific": {}}
             )
 
-        self.assertEqual(headers["X-Preferenced-Language"], "zh-CN")
+        self.assertEqual(headers["x-preferenced-language"], "zh-cn")
         self.assertEqual(headers["x-user-region"], "CN")
 
 
