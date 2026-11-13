@@ -63,6 +63,15 @@ class SessionCancellationTests(unittest.IsolatedAsyncioTestCase):
                 (main_module, "_bind_usage_turn", Mock()),
                 (main_module, "_track_usage_from_result", Mock()),
                 (main_module, "_track_usage_from_chunk", Mock()),
+                # Pacing is process-global by account.  Each lifecycle case
+                # models an independent request, so do not let one subtest's
+                # deliberate start timestamp delay the next one's mocked
+                # create coroutine.
+                (main_module, "_CHAT_PACING_LOCKS", {}),
+                (main_module, "_CHAT_PACING_LAST_STARTED", {}),
+                (main_module, "_CHAT_PACING_MULTIPLIER", {}),
+                (main_module, "_CHAT_REQUEST_GATES", {}),
+                (main_module, "_CHAT_ACCOUNT_COOLDOWNS", {}),
             ):
                 stack.enter_context(patch.object(target, name, replacement))
             yield state
@@ -815,6 +824,11 @@ class ChatResponseOwnershipTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main_module, "_track_usage_from_chunk"),
             patch.object(main_module, "_track_usage_from_result"),
             patch.object(main_module, "_capture_chat_session_auth"),
+            patch.object(main_module, "_CHAT_PACING_LOCKS", {}),
+            patch.object(main_module, "_CHAT_PACING_LAST_STARTED", {}),
+            patch.object(main_module, "_CHAT_PACING_MULTIPLIER", {}),
+            patch.object(main_module, "_CHAT_REQUEST_GATES", {}),
+            patch.object(main_module, "_CHAT_ACCOUNT_COOLDOWNS", {}),
         ):
             yield state
 
@@ -916,6 +930,30 @@ class ChatResponseOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(asyncio.CancelledError) as cancelled:
                         await task
                     self.assertEqual(cancelled.exception.args, ("client disconnected",))
+                state.owned.close.assert_called_once()
+
+    async def test_stream_error_records_account_failure_once(self):
+        for path in self.paths:
+            with self.subTest(path=path), self.mocks(path) as state:
+                async def translate(*_args, **_kwargs):
+                    raise RuntimeError("HTTP 429 upstream rate limited")
+                    yield "unreachable"
+
+                record_failure = Mock()
+                with (
+                    patch.object(main_module, "translate_ide_stream", translate),
+                    patch.object(main_module, "_record_chat_failure", record_failure),
+                ):
+                    response = await self.run_chat(path)
+                    with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
+                        await anext(response.body_iterator)
+                    await response.body_iterator.aclose()
+
+                record_failure.assert_called_once()
+                account_id, token, error = record_failure.call_args.args
+                self.assertEqual(account_id, "account-1")
+                self.assertEqual(token, "jwt-token")
+                self.assertIn("HTTP 429", str(error))
                 state.owned.close.assert_called_once()
 
     async def test_public_stream_closes_unclaimed_sync_response(self):

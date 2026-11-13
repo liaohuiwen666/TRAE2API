@@ -20,8 +20,13 @@ class SessionHistoryHashingTests(unittest.TestCase):
     def setUp(self):
         main_module._CHAT_HISTORY_SESSIONS.clear()
         main_module._UPSTREAM_SESSION_LEASES.clear()
+        # Lease validation consults the 1.3.0 chat cooldown table.  A pinned
+        # session is only meaningful on a healthy account, so these tests run
+        # with a clean cooldown table like the lease/history tables above.
+        main_module._CHAT_ACCOUNT_COOLDOWNS.clear()
         self.addCleanup(main_module._CHAT_HISTORY_SESSIONS.clear)
         self.addCleanup(main_module._UPSTREAM_SESSION_LEASES.clear)
+        self.addCleanup(main_module._CHAT_ACCOUNT_COOLDOWNS.clear)
 
     def _account(self, account_id="account-a"):
         stack = ExitStack()

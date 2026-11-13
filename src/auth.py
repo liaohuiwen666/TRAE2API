@@ -24,7 +24,7 @@ from typing import Optional
 
 import httpx
 
-from . import trae_decrypt
+from . import trae_decrypt, trae_tls
 
 logger = logging.getLogger(__name__)
 
@@ -398,7 +398,7 @@ async def refresh_token() -> bool:
             "UserID": user_id,
         }
 
-        async with httpx.AsyncClient(
+        async with trae_tls.upstream_async_client(
             timeout=30, **proxy_httpx_kwargs(captured_account_id)
         ) as client:
             resp = await client.post(url, json=payload)
@@ -530,7 +530,7 @@ async def refresh_account(account_id: str) -> bool:
             "ClientSecret": "-",
             "UserID": user_id,
         }
-        async with httpx.AsyncClient(
+        async with trae_tls.upstream_async_client(
             timeout=30, **proxy_httpx_kwargs(account_id)
         ) as client:
             resp = await client.post(url, json=payload)

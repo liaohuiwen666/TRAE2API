@@ -27,6 +27,8 @@ from typing import Optional
 
 import httpx
 
+from . import trae_tls
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CLIENT_ID = "ono9krqynydwx5"
@@ -77,7 +79,7 @@ async def start_device_authorization(
     }
 
     logger.info("auth-cli: POST %s", url)
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with trae_tls.upstream_async_client(timeout=30) as client:
         resp = await client.post(url, json=payload)
         text = resp.text
 
@@ -130,7 +132,7 @@ async def poll_user_token(
     deadline = start + MAX_POLL_TIME
 
     attempt = 0
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with trae_tls.upstream_async_client(timeout=30) as client:
         while time.time() < deadline:
             attempt += 1
             payload = {
@@ -255,7 +257,7 @@ async def exchange_refresh_token(
         "UserID": user_id,
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with trae_tls.upstream_async_client(timeout=30) as client:
         resp = await client.post(url, json=payload)
         text = resp.text
 

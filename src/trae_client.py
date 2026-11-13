@@ -33,7 +33,7 @@ from typing import Any, AsyncIterator, Callable, Mapping, Optional
 import anyio
 import httpx
 
-from . import auth, images, raw_client
+from . import auth, images, raw_client, trae_tls
 from .cli_client import (
     renderer_block_text,
     sanitize_assistant_history_messages,
@@ -513,23 +513,30 @@ class IdeChatResponse:
                     release_slot()
 
 
-_current_device: Optional[DeviceInfo] = None
+def get_current_device(token: str = "", account_id: str = "") -> DeviceInfo:
+    """Return the deterministic IDE device for one account.
 
+    IDE and check-in calls intentionally share the same account-derived device
+    generation. A 9074 generation advance therefore moves only that account
+    to a fresh identity; there is no process-global random fingerprint.
+    """
 
-def get_current_device() -> DeviceInfo:
-    """获取/轮换设备指纹。trae2api 在几次请求后换一次。"""
-    global _current_device
-    if _current_device is None or _current_device.use_count >= _current_device.max_uses:
-        device = DeviceInfo(
-            machine_id="".join(random.choices("0123456789abcdef", k=32)),
-            device_id=str(random.randint(10**17, 10**18 - 1)),
-            brand=random.choice(_DEVICE_BRANDS),
-            use_count=0,
-            max_uses=3 + random.randint(0, 2),
-        )
-        _current_device = device
-    _current_device.use_count += 1
-    return _current_device
+    token = str(token or auth.get_token() or "")
+    account_id = str(account_id or auth.get_user_id() or "")
+    device_id = checkin_device_id_for(token, account_id)
+    identity = _checkin_identity(token, account_id)
+    if not device_id or not identity:
+        raise ValueError("account identity is required to derive an IDE device")
+    machine_seed = "\x1f".join([identity, device_id, "traework-linux-probe"])
+    machine_id = hashlib.sha256(machine_seed.encode("utf-8")).hexdigest()
+    brand_index = int(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8], 16)
+    return DeviceInfo(
+        machine_id=machine_id,
+        device_id=device_id,
+        brand=_DEVICE_BRANDS[brand_index % len(_DEVICE_BRANDS)],
+        use_count=0,
+        max_uses=0,
+    )
 
 
 def convert_model_name(model: str) -> str:
@@ -679,9 +686,9 @@ def build_headers(
     optional overrides keep that request independent from global account
     rotation while retaining the historic call signature for other callers.
     """
-    device = get_current_device()
     token = token_override or auth.get_token()
     user_id = user_id_override or auth.get_user_id()
+    device = get_current_device(token, user_id)
     return {
         "Content-Type": "application/json",
         "Authorization": f"Cloud-IDE-JWT {token}",
@@ -917,7 +924,7 @@ async def _post_checkin(
         raise RuntimeError("No Cloud-IDE-JWT token available")
     base = os.environ.get("TRAE_UG_API_HOST", TRAE_UG_API_HOST).rstrip("/")
     url = f"{base}{path}"
-    async with httpx.AsyncClient(
+    async with trae_tls.upstream_async_client(
         timeout=30, **auth.proxy_httpx_kwargs(account_id)
     ) as client:
         resp = await client.post(
@@ -975,7 +982,7 @@ async def fetch_account_credits(
     url = f"{base}/trae/api/v2/pay/ide_user_ent_usage"
     payload = {"require_usage": True, "req_source": req_source}
     account_id = str(account_id or _checkin_identity(token) or "")
-    async with httpx.AsyncClient(
+    async with trae_tls.upstream_async_client(
         timeout=30, **auth.proxy_httpx_kwargs(account_id)
     ) as client:
         resp = await client.post(
@@ -1005,7 +1012,7 @@ async def fetch_user_info(token: str = "", *, account_id: str = "") -> dict:
     base = os.environ.get("TRAE_UG_API_HOST", TRAE_UG_API_HOST).rstrip("/")
     url = f"{base}/cloudide/api/v3/trae/GetUserInfo"
     headers = {"Content-Type": "application/json", "x-cloudide-token": token}
-    async with httpx.AsyncClient(
+    async with trae_tls.upstream_async_client(
         timeout=20,
         **auth.proxy_httpx_kwargs(account_id or _checkin_identity(token)),
     ) as client:
@@ -1292,7 +1299,7 @@ async def fetch_session_usage(
     }
     timeout = float(os.environ.get("TRAE_USAGE_QUERY_TIMEOUT_SECONDS", "15") or "15")
     timeout = max(1.0, min(timeout, 60.0))
-    async with httpx.AsyncClient(
+    async with trae_tls.upstream_async_client(
         timeout=timeout,
         **auth.proxy_httpx_kwargs(account_id or _checkin_identity(token)),
     ) as client:
@@ -2094,7 +2101,7 @@ async def _fetch_web_model_configs(
             if provider_specific is not None
             else None
         )
-        async with httpx.AsyncClient(
+        async with trae_tls.upstream_async_client(
             headers=build_web_headers(token, header_options),
             timeout=30,
             **auth.proxy_httpx_kwargs(account_id or _checkin_identity(token)),
@@ -2336,7 +2343,7 @@ async def _fetch_solo_model_configs(
             os.environ.get("TRAE_SOLO_MODEL_LIST_TIMEOUT_SECONDS", "8") or "8"
         )
         timeout = max(1.0, min(timeout, 20.0))
-        async with httpx.AsyncClient(
+        async with trae_tls.upstream_async_client(
             timeout=timeout,
             **auth.proxy_httpx_kwargs(account_id or _checkin_identity(token)),
         ) as client:
@@ -3683,7 +3690,7 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
                     # Keep the request valid by removing effort fields from
                     # this legacy attempt until a scoped descriptor exists.
                     endpoint_options.pop("_traecode_model_descriptor", None)
-            client = httpx.Client(
+            client = trae_tls.upstream_sync_client(
                 headers=endpoint_headers,
                 timeout=timeout,
                 http2=False,

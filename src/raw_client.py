@@ -24,7 +24,7 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import httpx
 
-from . import auth
+from . import auth, trae_tls
 from .cli_client import (
     renderer_block_text,
     strip_tool_call_blocks,
@@ -215,9 +215,17 @@ class RawModel:
 class TraeCodeRateLimitError(RuntimeError):
     """An HTTP limit that requires account rotation instead of gateway fallback."""
 
-    def __init__(self, status_code: int, code: Any, detail: str):
+    def __init__(
+        self,
+        status_code: int,
+        code: Any,
+        detail: str,
+        retry_after: str = "",
+    ):
         self.status_code = status_code
         self.code = code
+        self.retry_after = retry_after
+        self.headers = {"Retry-After": retry_after} if retry_after else {}
         super().__init__(
             f"TraeCode raw chat rate limit {code} (HTTP {status_code})"
             + (f": {detail}" if detail else "")
@@ -1524,7 +1532,7 @@ async def send_traecode_chat_request(
         detail = ""
         transport_error: Optional[httpx.RequestError] = None
         try:
-            client = httpx.Client(
+            client = trae_tls.upstream_sync_client(
                 http2=False,
                 **_proxy_client_kwargs(
                     str(options.get("_account_id") or ""), timeout
@@ -1575,6 +1583,7 @@ async def send_traecode_chat_request(
                     status_code = response.status_code
                     detail = ""
                     rate_limit_code = 429 if status_code == 429 else None
+                    retry_after = str(response.headers.get("Retry-After") or "")
                     try:
                         # Read the body before closing it so the connection can
                         # be reused for the next host/path candidate.
@@ -1618,7 +1627,10 @@ async def send_traecode_chat_request(
                         # Every candidate uses the same credential, so probing
                         # another host/path only repeats an account-level limit.
                         raise TraeCodeRateLimitError(
-                            status_code, rate_limit_code, detail
+                            status_code,
+                            rate_limit_code,
+                            detail,
+                            retry_after,
                         )
             if transport_error is not None:
                 raise TraeCodeTransportError(
@@ -3328,7 +3340,7 @@ async def send_raw_chat_request(
         client: Optional[httpx.Client] = None
         response: Optional[httpx.Response] = None
         try:
-            client = httpx.Client(
+            client = trae_tls.upstream_sync_client(
                 http2=False,
                 **_proxy_client_kwargs(
                     str(options.get("_account_id") or ""), timeout

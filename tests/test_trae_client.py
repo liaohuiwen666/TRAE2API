@@ -237,6 +237,41 @@ def _fake_jwt(user_id: str, issued_at: int) -> str:
 
 
 class CheckinDeviceTests(unittest.TestCase):
+    def test_ide_device_is_account_stable_and_matches_checkin_generation(self):
+        first = _fake_jwt("ide-account-42", 100)
+        refreshed = _fake_jwt("ide-account-42", 200)
+        other = _fake_jwt("ide-account-43", 100)
+        with (
+            patch.object(trae_client, "_CHECKIN_DEVICE_IDS", {}),
+            patch.object(trae_client, "_CHECKIN_DEVICE_GENERATIONS", {}),
+        ):
+            initial = trae_client.get_current_device(first, "stored-a")
+            repeated = trae_client.get_current_device(refreshed, "renamed-a")
+            unrelated = trae_client.get_current_device(other, "stored-b")
+            self.assertEqual(initial.device_id, repeated.device_id)
+            self.assertEqual(initial.machine_id, repeated.machine_id)
+            self.assertNotEqual(initial.device_id, unrelated.device_id)
+            self.assertNotEqual(initial.machine_id, unrelated.machine_id)
+            headers = trae_client.build_headers(first, "stored-a")
+            self.assertEqual(headers["x-device-id"], initial.device_id)
+            self.assertEqual(headers["x-machine-id"], initial.machine_id)
+
+    def test_9074_generation_advance_changes_only_the_affected_ide_device(self):
+        first = _fake_jwt("ide-account-a", 100)
+        second = _fake_jwt("ide-account-b", 100)
+        with (
+            patch.object(trae_client, "_CHECKIN_DEVICE_IDS", {}),
+            patch.object(trae_client, "_CHECKIN_DEVICE_GENERATIONS", {}),
+            patch.object(trae_client.auth, "get_account_record", return_value={}),
+            patch.object(trae_client.auth, "merge_account_retry"),
+        ):
+            before_a = trae_client.get_current_device(first).device_id
+            before_b = trae_client.get_current_device(second).device_id
+            after_a = trae_client.rotate_checkin_device_id(first)
+            after_b = trae_client.get_current_device(second).device_id
+            self.assertNotEqual(before_a, after_a)
+            self.assertEqual(before_b, after_b)
+
     def test_device_id_survives_jwt_refresh_for_same_account(self):
         first = _fake_jwt("account-42", 100)
         refreshed = _fake_jwt("account-42", 200)

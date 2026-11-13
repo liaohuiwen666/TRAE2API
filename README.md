@@ -4,9 +4,17 @@
 
 Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通道包装成 OpenAI 兼容 API（Chat Completions + Responses），支持调用方工具调用、thinking 分离输出、思考强度映射、多账号并发轮询、每日签到和积分消费记录，可直接接入 Codex、new-api 和各类 OpenAI SDK。
 
-**独立版本 v1.2.0，基于 [autumnsentiment/trae2api-cn](https://github.com/autumnsentiment/trae2api-cn)（MIT）二次开发，新增随机签到面板设置与分账号代理（见下）。**
+**独立版本 v1.3.0，基于 [autumnsentiment/trae2api-cn](https://github.com/autumnsentiment/trae2api-cn)（MIT）二次开发，新增安全加固、随机签到面板设置与分账号代理（见下）。**
 
 **仅供学习使用。请勿用于商业用途。**
+
+## 1.3.0 新增
+
+- **账号隔离设备身份**：IDE、Remote/Work 与签到使用账号稳定派生的设备标识；9074 仅推进受影响账号的设备代际，不会影响其他账号。
+- **会话粘滞校验**：每一轮复用会话前会重新检查账号启用状态、可用并发与积分余额；不可用时自动重新选择可用账号。
+- **Chrome TLS 指纹**：所有 Trae 上游请求通过 `curl_cffi` 的 Chrome impersonation 发送，并保持每账号代理链路。
+- **轻量聊天节奏控制**：同一账号的聊天请求串行、最小间隔约 400ms（含随机抖动）；上游限流后会临时加大间隔。
+- **会话空闲 TTL**：默认从 3600 秒调整为 1800 秒，可继续通过 `TRAE_CHAT_SESSION_TTL_SECONDS` 覆盖。
 
 ## 1.2.0 新增
 
@@ -201,6 +209,7 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_WORK_BASE_URL` | 空 | 旧版 TraeWork raw 诊断链路的可选网关；正常 `work` 请求使用 `TRAE_WEB_BASE_URL` 的 Remote `chat_sessions` |
 | `TRAE_MODEL_REQUEST_PARALLEL_LIMIT` | 空 | 可选的进程级模型请求与原生工具流硬上限（限制为 1-64）；留空时 Web/Remote/Raw/IDE 按账号 entitlement 的 `solo_agent_parallel_limit` 调度，免费或未知账号保守使用 2 槽。旧变量 `TRAE_WEB_PARALLEL_LIMIT` 仅在新变量未设置时作为兼容别名；未登记单 token 链路仍使用兼容默认 4 |
 | `TRAE_WEB_IDLE_TIMEOUT` | `60` | 空闲会话回收超时（秒） |
+| `TRAE_CHAT_SESSION_TTL_SECONDS` | `1800` | Chat Completions / Anthropic 粘滞账号与上游会话绑定的空闲有效期（秒）；兼容别名 `TRAE_SESSION_IDLE_TIMEOUT_SECONDS` 优先 |
 | `TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS` | `120` | remote 会话创建成功但没有首个 SSE 事件时的重试等待；首事件前 EOF/读超时同样按可重试空响应处理，`0` 表示关闭独立首事件期限 |
 | `TRAE_MODEL_LIST_CACHE_TTL` | `300` | `/v1/models` 上游模型列表缓存秒数。列表合并 Remote 的 Agent / Work / Design 目录与 Solo 原生 `get_detail_param` 目录，保留上游精确大小写并为混合大小写配置提供小写别名，条目带 `endpoint`/`endpoints` 并按端点排序；控制类内部模型会隐藏，保留 `auto`；上游拉取失败时回落内置列表 |
 | `TRAE_SOLO_MODEL_LIST_TIMEOUT_SECONDS` | `8` | Solo 原生模型目录补齐请求的超时秒数；仅用于 Remote 目录缺失模型的发现与列表合并 |

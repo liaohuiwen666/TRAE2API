@@ -2352,17 +2352,24 @@ class SessionLeaseTests(unittest.TestCase):
 
     def test_continuation_reuses_initial_account_and_token_snapshot(self):
         messages = [{"role": "user", "content": "inspect the workspace"}]
+        valid_record = {
+            "token": "header." + ("a" * 140) + ".signature",
+            "user_id": "account-1",
+            "source": "web-login",
+            "expired_at": "2099-01-01T00:00:00Z",
+            "provider_specific": {},
+        }
         with (
             patch("src.main.UPSTREAM_MODE", "raw"),
             patch("src.main.auth.next_polling_account") as rotate,
             patch("src.main.auth.get_active_account_id", return_value="account-1"),
             patch(
                 "src.main.auth.get_active_account_snapshot",
-                return_value=("account-1", {"token": "first-jwt"}),
+                return_value=("account-1", valid_record),
             ),
             patch(
                 "src.main.auth.get_account_record",
-                return_value={"token": "first-jwt"},
+                return_value=valid_record,
             ) as account,
             patch("src.main.auth.get_token", return_value="fallback-jwt"),
         ):
@@ -2380,13 +2387,13 @@ class SessionLeaseTests(unittest.TestCase):
             )
 
         self.assertEqual(first["_account_id"], "account-1")
-        self.assertEqual(first["_auth_token"], "first-jwt")
+        self.assertEqual(first["_auth_token"], valid_record["token"])
         self.assertEqual(second["_account_id"], "account-1")
-        self.assertEqual(second["_auth_token"], "first-jwt")
+        self.assertEqual(second["_auth_token"], valid_record["token"])
         self.assertEqual(rotate.call_count, 1)
-        # The atomic snapshot supplies the credential and avoids a second
-        # mutable account-store read.
-        self.assertEqual(account.call_count, 0)
+        # Lease reuse validates the current stored account on every turn;
+        # the original lease credential remains the immutable dispatch token.
+        self.assertEqual(account.call_count, 1)
 
     def test_ide_and_work_new_sessions_participate_in_polling(self):
         """Explicit IDE/Work selections must rotate accounts like Remote."""

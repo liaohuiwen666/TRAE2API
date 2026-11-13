@@ -41,7 +41,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
 import dotenv
@@ -66,6 +66,8 @@ from . import (
     responses_api,
     trae_client,
     trae_remote_client,
+    trae_security,
+    trae_tls,
     traework_compat,
     traework_native_bridge,
 )
@@ -595,9 +597,9 @@ _CHAT_SESSION_TTL = max(
     float(
         os.environ.get(
             "TRAE_SESSION_IDLE_TIMEOUT_SECONDS",
-            os.environ.get("TRAE_CHAT_SESSION_TTL_SECONDS", "3600"),
+            os.environ.get("TRAE_CHAT_SESSION_TTL_SECONDS", "1800"),
         )
-        or "3600"
+        or "1800"
     ),
 )
 _CHAT_SESSION_MAX = max(64, int(os.environ.get("TRAE_CHAT_SESSION_CACHE_SIZE", "2048") or "2048"))
@@ -617,6 +619,239 @@ class _UpstreamSessionLease:
 
 
 _UPSTREAM_SESSION_LEASES: OrderedDict[str, _UpstreamSessionLease] = OrderedDict()
+
+
+@dataclass
+class _AccountFailureCooldown:
+    kind: str
+    until: float
+    token_fingerprint: str = ""
+    transient_count: int = 0
+
+
+# These are deliberately chat-only: dashboard, check-in and authentication
+# probes must not be paced or parked behind model traffic.
+_CHAT_ACCOUNT_COOLDOWNS: dict[str, _AccountFailureCooldown] = {}
+_CHAT_PACING_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
+_CHAT_PACING_LAST_STARTED: dict[str, float] = {}
+_CHAT_PACING_MULTIPLIER: dict[str, float] = {}
+_CHAT_REQUEST_GATES: dict[tuple[int, str], asyncio.Lock] = {}
+_CHAT_PACING_BASE_SECONDS = 0.4
+_CHAT_PACING_JITTER_SECONDS = 0.120
+
+
+def _credit_remaining_is_positive(account_id: str) -> bool:
+    """Treat an unknown balance as unverified, but a known zero as unusable."""
+
+    credits = auth.get_account_credit_state(account_id)
+    if not credits or credits.get("unlimited"):
+        return True
+    value = credits.get("remaining")
+    if value is None:
+        value = credits.get("official_remaining")
+    if value is None:
+        return True
+    try:
+        return float(value) > 0.0
+    except (TypeError, ValueError):
+        return True
+
+
+def _account_cooldown_reason(account_id: str, token: str = "") -> str:
+    state = _CHAT_ACCOUNT_COOLDOWNS.get(str(account_id or ""))
+    if state is None:
+        return ""
+    fingerprint = hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+    # Auth-dead is tied to a credential, not an account forever. A refreshed
+    # token immediately makes the account eligible again.
+    if state.kind == trae_security.FAILURE_AUTH_DEAD and (
+        fingerprint and fingerprint != state.token_fingerprint
+    ):
+        _CHAT_ACCOUNT_COOLDOWNS.pop(str(account_id or ""), None)
+        return ""
+    if state.until <= time.monotonic():
+        _CHAT_ACCOUNT_COOLDOWNS.pop(str(account_id or ""), None)
+        return ""
+    return state.kind
+
+
+def classify_upstream_failure(error: BaseException | str | None) -> str | None:
+    """Publicly testable wrapper for the shared failure classifier."""
+
+    return trae_security.classify_upstream_failure(error)
+
+
+def _record_chat_failure(account_id: str, token: str, error: BaseException | str) -> str | None:
+    """Park one account according to a classified chat-path failure."""
+
+    account_id = str(account_id or "")
+    if not account_id:
+        return None
+    kind = classify_upstream_failure(error)
+    if kind is None:
+        return None
+    previous = _CHAT_ACCOUNT_COOLDOWNS.get(account_id)
+    transient_count = (
+        previous.transient_count + 1
+        if kind == trae_security.FAILURE_TRANSIENT and previous is not None
+        else 0
+    )
+    retry_after = trae_security.retry_after_from_error(error)
+    seconds = trae_security.cooldown_seconds(
+        kind,
+        retry_after=retry_after,
+        consecutive_transient=transient_count,
+    )
+    _CHAT_ACCOUNT_COOLDOWNS[account_id] = _AccountFailureCooldown(
+        kind=kind,
+        until=time.monotonic() + seconds,
+        token_fingerprint=hashlib.sha256(str(token or "").encode("utf-8")).hexdigest(),
+        transient_count=transient_count,
+    )
+    if kind == trae_security.FAILURE_RATE_LIMIT:
+        _CHAT_PACING_MULTIPLIER[account_id] = min(
+            4.0, max(1.0, _CHAT_PACING_MULTIPLIER.get(account_id, 1.0)) * 2.0
+        )
+    logger.warning(
+        "chat account cooldown account=%s kind=%s seconds=%s",
+        account_id,
+        kind,
+        "until-refresh" if seconds == float("inf") else int(seconds),
+    )
+    return kind
+
+
+async def _pace_chat_request(account_id: str) -> None:
+    """Serialize chat starts and add a small, cryptographically random jitter."""
+
+    account_id = str(account_id or "")
+    if not account_id:
+        return
+    loop = asyncio.get_running_loop()
+    key = (id(loop), account_id)
+    lock = _CHAT_PACING_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CHAT_PACING_LOCKS[key] = lock
+    async with lock:
+        now = time.monotonic()
+        previous = _CHAT_PACING_LAST_STARTED.get(account_id)
+        if previous is not None:
+            multiplier = _CHAT_PACING_MULTIPLIER.get(account_id, 1.0)
+            # Decay the temporary rate-limit penalty on ordinary subsequent
+            # starts; the floor remains the mandatory 400 ms gap.
+            _CHAT_PACING_MULTIPLIER[account_id] = max(1.0, multiplier * 0.8)
+            jitter = secrets.randbelow(121) / 1000.0
+            target_gap = _CHAT_PACING_BASE_SECONDS * multiplier + jitter
+            wait_for = max(0.0, target_gap - (now - previous))
+            if wait_for:
+                await asyncio.sleep(wait_for)
+        _CHAT_PACING_LAST_STARTED[account_id] = time.monotonic()
+
+
+async def _acquire_chat_request_gate(account_id: str) -> Callable[[], None]:
+    """Permit one live model/chat request per account.
+
+    Entitlement slots can legitimately allow concurrent native tool streams,
+    but chat requests receive a stricter per-account lane.  The returned
+    idempotent releaser is owned by the response cleanup path, so a streaming
+    request holds the gate until its upstream client is closed.
+    """
+
+    account_id = str(account_id or "")
+    if not account_id:
+        return lambda: None
+    key = (id(asyncio.get_running_loop()), account_id)
+    gate = _CHAT_REQUEST_GATES.get(key)
+    if gate is None:
+        gate = asyncio.Lock()
+        _CHAT_REQUEST_GATES[key] = gate
+    await gate.acquire()
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if released:
+            return
+        released = True
+        if gate.locked():
+            gate.release()
+
+    return release
+
+
+def _lease_reuse_invalid_reason(
+    lease: _UpstreamSessionLease, requested_model: str = ""
+) -> str:
+    """Validate a sticky lease at the start of every client turn."""
+
+    account_id = str(lease.account_id or "")
+    record = auth.get_account_record(account_id) if account_id else {}
+    if account_id and record and not auth._record_model_eligible(record):
+        return "disabled or unhealthy"
+    cooldown = _account_cooldown_reason(account_id, lease.auth_token)
+    if cooldown:
+        return f"{cooldown} cooldown"
+    if account_id and not _credit_remaining_is_positive(account_id):
+        return "credits exhausted"
+    if account_id and auth.account_capacity_snapshot(account_id).get("available", 0) <= 0:
+        return "no free concurrency slot"
+    requested = str(requested_model or "").strip().lower()
+    if requested and requested != "auto":
+        scope = {
+            "_account_id": account_id,
+            "_auth_token": lease.auth_token,
+        }
+        names = _task_catalog_model_names(scope)
+        if names and not _task_model_available(requested, scope):
+            return "requested model unavailable"
+    return ""
+
+
+def _reserve_usable_model_account(
+    *,
+    require_polling: bool,
+    preferred_account_id: str = "",
+    activate: bool = True,
+    requested_model: str = "",
+) -> tuple[str, dict]:
+    """Reserve only an enabled, healthy, credit-positive account.
+
+    The scheduler retains its credit-priority ordering; this wrapper merely
+    filters candidates that became unhealthy after their prior selection.
+    """
+
+    excluded: set[str] = set()
+    for _ in range(max(1, len(auth.get_accounts_raw()) + 1)):
+        account_id, record = auth.reserve_model_account(
+            preferred_account_id=preferred_account_id,
+            require_polling=require_polling,
+            excluded_account_ids=excluded,
+            activate=activate,
+        )
+        if not account_id:
+            return "", {}
+        token = str(record.get("token") or "")
+        reason = _account_cooldown_reason(account_id, token)
+        if not reason and not _credit_remaining_is_positive(account_id):
+            reason = "credits exhausted"
+        if not reason and requested_model and requested_model.strip().lower() != "auto":
+            scope = {
+                "_account_id": account_id,
+                "_auth_token": token,
+            }
+            names = _task_catalog_model_names(scope)
+            if names and not _task_model_available(requested_model, scope):
+                reason = "requested model unavailable"
+        if not reason:
+            return account_id, record
+        auth.cancel_account_slot_reservation(
+            account_id, str(record.get("_slot_reservation_id") or "")
+        )
+        excluded.add(account_id)
+        if preferred_account_id:
+            return "", {}
+    return "", {}
 
 
 class _ModelAccountUnavailable(RuntimeError):
@@ -1019,7 +1254,7 @@ async def _exchange_refresh_token(refresh_token: str, client_id: str, host: str 
         "UserID": "",
     }
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with trae_tls.upstream_async_client(timeout=20) as client:
             resp = await client.post(url, json=payload)
             body = resp.text
             status = resp.status_code
@@ -1083,7 +1318,7 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
 _LUCIDE_ICONS = {
@@ -6054,6 +6289,7 @@ def _bind_chat_session(
     *,
     requested_session_id: str = "",
     rotate_for_new: bool = True,
+    requested_model: str = "",
 ) -> dict:
     """Attach a stable upstream session and account to one API request."""
     enterprise = auth.get_enterprise_settings()
@@ -6147,6 +6383,22 @@ def _bind_chat_session(
             session_id = uuid_mod.uuid4().hex
 
         lease = _UPSTREAM_SESSION_LEASES.get(session_id)
+        lease_was_invalid = False
+        if lease is not None and not enterprise_enabled:
+            invalid_reason = _lease_reuse_invalid_reason(lease, requested_model)
+            if invalid_reason:
+                # Sticky affinity is useful only while the selected account is
+                # actually usable. Remove the stale lease before selection so
+                # the next turn takes the normal credit-priority path.
+                logger.info(
+                    "chat lease rebind session=%s account=%s reason=%s",
+                    session_id[:32],
+                    lease.account_id,
+                    invalid_reason,
+                )
+                _UPSTREAM_SESSION_LEASES.pop(session_id, None)
+                lease = None
+                lease_was_invalid = True
         # A reservation belongs to this API request, not to the logical chat
         # lease.  It is consumed by the selected transport (or cancelled by
         # the dispatch wrapper if routing fails before a transport opens).
@@ -6162,8 +6414,9 @@ def _bind_chat_session(
                 # Selection and reservation are one operation.  This is what
                 # lets credit-priority polling fill every entitlement slot on
                 # the richest account before moving to the next account.
-                selected_snapshot = auth.reserve_model_account(
-                    require_polling=polling_enabled,
+                selected_snapshot = _reserve_usable_model_account(
+                    require_polling=polling_enabled or lease_was_invalid,
+                    requested_model=requested_model,
                     **(
                         {
                             "preferred_account_id": enterprise_account_id,
@@ -6280,8 +6533,10 @@ def _bind_chat_session(
                 # A logical session can have multiple simultaneous turns.  Each
                 # turn therefore reserves its own account slot while retaining
                 # the session's credential affinity.
-                selected_snapshot = auth.reserve_model_account(
+                selected_snapshot = _reserve_usable_model_account(
                     preferred_account_id=lease.account_id,
+                    require_polling=False,
+                    requested_model=requested_model,
                     **({"activate": False} if enterprise_enabled else {}),
                 )
                 if selected_snapshot[0]:
@@ -8868,13 +9123,21 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
     bound_options["provider_specific"] = (
         dict(provider_specific) if isinstance(provider_specific, Mapping) else {}
     )
-    slot_lease_token = await trae_client.acquire_web_slot(
-        account_id,
-        timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")),
-        reservation_id=str(
-            bound_options.get("_account_slot_reservation_id") or ""
-        ),
-    )
+    release_chat_gate = await _acquire_chat_request_gate(account_id)
+    try:
+        await _pace_chat_request(account_id)
+        slot_lease_token = await trae_client.acquire_web_slot(
+            account_id,
+            timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")),
+            reservation_id=str(
+                bound_options.get("_account_slot_reservation_id") or ""
+            ),
+        )
+    except BaseException:
+        # No response cleanup task exists yet.  Do not leave a request lane
+        # held when pacing is cancelled or entitlement reservation fails.
+        release_chat_gate()
+        raise
     client = None
     session_id = ""
     message_id = ""
@@ -8896,7 +9159,10 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
                 if client is not None:
                     await client.aclose()
             finally:
-                trae_client.release_web_slot_owned(account_id, slot_lease_token)
+                try:
+                    trae_client.release_web_slot_owned(account_id, slot_lease_token)
+                finally:
+                    release_chat_gate()
 
     async def close_web_session() -> None:
         nonlocal cleanup_task
@@ -8905,7 +9171,9 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
         await _await_session_cleanup(cleanup_task)
 
     try:
-        client = httpx.AsyncClient(**_proxy_async_client_kwargs(account_id, 60))
+        client = trae_tls.upstream_async_client(
+            **_proxy_async_client_kwargs(account_id, 60)
+        )
         session_id, message_id = await trae_client.create_web_session(
             client,
             model,
@@ -8934,6 +9202,9 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
                     ):
                         _track_usage_from_chunk(chunk, model)
                         yield chunk
+                except Exception as exc:
+                    _record_chat_failure(account_id, token, exc)
+                    raise
                 finally:
                     await close_web_session()
             return StreamingResponse(
@@ -9088,7 +9359,10 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                 if client is not None:
                     await client.aclose()
             finally:
-                release_slot_once()
+                try:
+                    release_slot_once()
+                finally:
+                    release_chat_gate()
 
     async def close_remote_session() -> None:
         nonlocal cleanup_task
@@ -9231,15 +9505,26 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             query_chars_before_bound,
             query_chars_after_bound,
         )
-    slot_lease_token = await trae_client.acquire_web_slot(
-        account_id,
-        timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")),
-        reservation_id=str(
-            remote_options.get("_account_slot_reservation_id") or ""
-        ),
-    )
+    release_chat_gate = await _acquire_chat_request_gate(account_id)
     try:
-        client = httpx.AsyncClient(**_proxy_async_client_kwargs(account_id, None))
+        await _pace_chat_request(account_id)
+        slot_lease_token = await trae_client.acquire_web_slot(
+            account_id,
+            timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")),
+            reservation_id=str(
+                remote_options.get("_account_slot_reservation_id") or ""
+            ),
+        )
+    except BaseException:
+        # The per-account request lane is acquired before we block on a
+        # capacity reservation.  Release it on setup failure; normal paths
+        # hand ownership to ``cleanup_remote_session`` below.
+        release_chat_gate()
+        raise
+    try:
+        client = trae_tls.upstream_async_client(
+            **_proxy_async_client_kwargs(account_id, None)
+        )
         logger.info(
             "remote create start id=%s account=%s model=%s messages=%d "
             "input_last_chars=%d query_chars=%d",
@@ -9272,7 +9557,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             failed_client = client
             client = None
             await _await_session_cleanup(asyncio.create_task(failed_client.aclose()))
-            client = httpx.AsyncClient(
+            client = trae_tls.upstream_async_client(
                 **_proxy_async_client_kwargs(account_id, None)
             )
             remote_options = work_fallback_options(remote_options)
@@ -9390,6 +9675,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                         retry_session_id = ""
                         retry_message_id = ""
                         retry_account_id = account_id
+                        retry_release_chat_gate: Callable[[], None] = lambda: None
 
                         async def cleanup_retry_session() -> None:
                             try:
@@ -9409,11 +9695,14 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                     if retry_client is not None:
                                         await retry_client.aclose()
                                 finally:
-                                    if slot_reacquired:
-                                        trae_client.release_web_slot_owned(
-                                            retry_account_id,
-                                            retry_slot_lease_token,
-                                        )
+                                    try:
+                                        if slot_reacquired:
+                                            trae_client.release_web_slot_owned(
+                                                retry_account_id,
+                                                retry_slot_lease_token,
+                                            )
+                                    finally:
+                                        retry_release_chat_gate()
 
                         try:
                             retry_options = dict(remote_options)
@@ -9474,6 +9763,10 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                     # and replay the turn. The caller receives
                                     # the original quota error instead.
                                     raise
+                            retry_release_chat_gate = (
+                                await _acquire_chat_request_gate(retry_account_id)
+                            )
+                            await _pace_chat_request(retry_account_id)
                             retry_slot_lease_token = await trae_client.acquire_web_slot(
                                 retry_account_id,
                                 timeout=float(
@@ -9487,7 +9780,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                 ),
                             )
                             slot_reacquired = True
-                            retry_client = httpx.AsyncClient(
+                            retry_client = trae_tls.upstream_async_client(
                                 **_proxy_async_client_kwargs(retry_account_id, None)
                             )
                             logger.info(
@@ -9551,8 +9844,9 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                 except GeneratorExit:
                     stream_status = "client_closed" if not saw_done else "completed"
                     raise
-                except Exception:
+                except Exception as exc:
                     stream_status = "error"
+                    _record_chat_failure(account_id, token, exc)
                     raise
                 finally:
                     logger.info(
@@ -9740,24 +10034,33 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
         )
 
     async def _open(kind: str):
-        if kind == "raw":
-            code_options = dict(options)
-            function = str(
-                code_options.get("_traecode_raw_chat_function") or "chat_v3"
-            )
-            code_options["_traecode_solo"] = function.startswith("solo_")
-            return await raw_client.send_traecode_chat_request(
-                messages,
-                model,
-                stream=stream,
-                options=code_options,
-            )
-        return await trae_client.send_chat_request(
-            messages,
-            model,
-            stream,
-            options=_legacy_options(),
-        )
+        account_id = str(options.get("_account_id") or "")
+        release_chat_gate = await _acquire_chat_request_gate(account_id)
+        try:
+            await _pace_chat_request(account_id)
+            if kind == "raw":
+                code_options = dict(options)
+                function = str(
+                    code_options.get("_traecode_raw_chat_function") or "chat_v3"
+                )
+                code_options["_traecode_solo"] = function.startswith("solo_")
+                response = await raw_client.send_traecode_chat_request(
+                    messages,
+                    model,
+                    stream=stream,
+                    options=code_options,
+                )
+            else:
+                response = await trae_client.send_chat_request(
+                    messages,
+                    model,
+                    stream,
+                    options=_legacy_options(),
+                )
+            return response, release_chat_gate
+        except BaseException:
+            release_chat_gate()
+            raise
 
     if not raw_requested:
         raw_kind = "legacy"
@@ -9768,9 +10071,10 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
         current_kind = raw_kind
         current_wrapper = None
         current_close = None
+        current_release_chat_gate: Callable[[], None] = lambda: None
         try:
             try:
-                current_wrapper = await _open(current_kind)
+                current_wrapper, current_release_chat_gate = await _open(current_kind)
             except Exception as exc:
                 if (
                     current_kind == "raw"
@@ -9779,7 +10083,7 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
                 ):
                     _mark_raw_fallback(exc)
                     current_kind = "legacy"
-                    current_wrapper = await _open(current_kind)
+                    current_wrapper, current_release_chat_gate = await _open(current_kind)
                 else:
                     raise
             current_close = _chat_response_closer(
@@ -9787,8 +10091,11 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
             )
 
             async def close_current():
-                if current_close is not None:
-                    await current_close()
+                try:
+                    if current_close is not None:
+                        await current_close()
+                finally:
+                    current_release_chat_gate()
 
         except BaseException:
             if current_close is not None:
@@ -9796,7 +10103,7 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
             raise
 
         async def gen():
-            nonlocal current_kind, current_wrapper, current_close
+            nonlocal current_kind, current_wrapper, current_close, current_release_chat_gate
             emitted_model_output = False
             while True:
                 try:
@@ -9836,11 +10143,16 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
                         await close_current()
                         _mark_raw_fallback(exc)
                         current_kind = "legacy"
-                        current_wrapper = await _open(current_kind)
+                        current_wrapper, current_release_chat_gate = await _open(current_kind)
                         current_close = _chat_response_closer(
                             current_wrapper, upstream_metadata
                         )
                         continue
+                    _record_chat_failure(
+                        str(options.get("_account_id") or ""),
+                        str(options.get("_auth_token") or ""),
+                        exc,
+                    )
                     await close_current()
                     raise
 
@@ -9858,12 +10170,20 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
     while True:
         response_wrapper = None
         close_response = None
+        release_chat_gate: Callable[[], None] = lambda: None
         try:
-            response_wrapper = await _open(current_kind)
+            response_wrapper, release_chat_gate = await _open(current_kind)
             response = response_wrapper.response
-            close_response = _chat_response_closer(
+            response_close = _chat_response_closer(
                 response_wrapper, upstream_metadata
             )
+
+            async def close_response() -> None:
+                try:
+                    await response_close()
+                finally:
+                    release_chat_gate()
+
             result = await collect_nonstream_ide(
                 response,
                 model,
@@ -9929,20 +10249,21 @@ async def run_traework_native_chat(
                 slot_account_id, slot_lease_token
             )
 
-    if slot_account_id:
-        try:
-            slot_timeout = float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
-        except (TypeError, ValueError):
-            slot_timeout = 60.0
-        slot_lease_token = await trae_client.acquire_web_slot(
-            slot_account_id,
-            timeout=max(0.0, slot_timeout),
-            reservation_id=str(
-                options.get("_account_slot_reservation_id") or ""
-            ),
-        )
-        slot_acquired = True
+    release_chat_gate = await _acquire_chat_request_gate(slot_account_id)
     try:
+        if slot_account_id:
+            try:
+                slot_timeout = float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
+            except (TypeError, ValueError):
+                slot_timeout = 60.0
+            slot_lease_token = await trae_client.acquire_web_slot(
+                slot_account_id,
+                timeout=max(0.0, slot_timeout),
+                reservation_id=str(
+                    options.get("_account_slot_reservation_id") or ""),
+            )
+            slot_acquired = True
+        await _pace_chat_request(slot_account_id)
         native_resp = await traework_native_bridge.send_native_chat_request(
             messages,
             model,
@@ -9950,7 +10271,10 @@ async def run_traework_native_chat(
             options=options,
         )
     except BaseException:
-        release_slot_once()
+        try:
+            release_slot_once()
+        finally:
+            release_chat_gate()
         raise
     close_native_response = _chat_response_closer(
         native_resp, upstream_metadata
@@ -9964,7 +10288,10 @@ async def run_traework_native_chat(
                 try:
                     await close_native_response()
                 finally:
-                    release_slot_once()
+                    try:
+                        release_slot_once()
+                    finally:
+                        release_chat_gate()
 
             close_task = asyncio.create_task(cleanup())
         await _await_session_cleanup(close_task)
@@ -9983,6 +10310,13 @@ async def run_traework_native_chat(
                     _bind_usage_turn_from_metadata(upstream_metadata)
                     _track_usage_from_chunk(chunk, model)
                     yield chunk
+            except Exception as exc:
+                _record_chat_failure(
+                    slot_account_id,
+                    str(options.get("_auth_token") or ""),
+                    exc,
+                )
+                raise
             finally:
                 await close_response()
 
@@ -10021,12 +10355,22 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
         len(messages),
         len(str(messages[-1].get("content") or "")) if messages else 0,
     )
-    raw_resp = await raw_client.send_raw_chat_request(messages, model, options)
+    chat_account_id = str((options or {}).get("_account_id") or "")
+    release_chat_gate = await _acquire_chat_request_gate(chat_account_id)
+    try:
+        await _pace_chat_request(chat_account_id)
+        raw_resp = await raw_client.send_raw_chat_request(messages, model, options)
+    except BaseException:
+        release_chat_gate()
+        raise
     current = raw_resp
     close_current = _chat_response_closer(current, upstream_metadata)
 
     async def close_response() -> None:
-        await close_current()
+        try:
+            await close_current()
+        finally:
+            release_chat_gate()
 
     try:
         logger.info(
@@ -10043,7 +10387,7 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
         raise
     if stream:
         async def gen():
-            nonlocal current, close_current
+            nonlocal current, close_current, release_chat_gate
             request_id = str((options or {}).get("_relay_request_id") or "")
             started_at = time.monotonic()
             chunk_count = 0
@@ -10100,6 +10444,10 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
                         await close_response()
 
                     try:
+                        release_chat_gate = await _acquire_chat_request_gate(
+                            chat_account_id
+                        )
+                        await _pace_chat_request(chat_account_id)
                         current = await raw_client.send_raw_chat_request(
                             messages, model, retry_options
                         )
@@ -10118,8 +10466,13 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
             except GeneratorExit:
                 stream_status = "client_closed" if not saw_done else "completed"
                 raise
-            except Exception:
+            except Exception as exc:
                 stream_status = "error"
+                _record_chat_failure(
+                    chat_account_id,
+                    str((options or {}).get("_auth_token") or ""),
+                    exc,
+                )
                 raise
             finally:
                 await close_response()
@@ -10182,6 +10535,8 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
         finally:
             await close_response()
         try:
+            release_chat_gate = await _acquire_chat_request_gate(chat_account_id)
+            await _pace_chat_request(chat_account_id)
             current = await raw_client.send_raw_chat_request(
                 messages, model, retry_options
             )
@@ -13167,6 +13522,11 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             return result
         except Exception as e:
             logger.warning("upstream %s failed: %s", mode, e)
+            _record_chat_failure(
+                str(mode_options.get("_account_id") or options.get("_account_id") or ""),
+                str(mode_options.get("_auth_token") or options.get("_auth_token") or ""),
+                e,
+            )
             # ``work-agent`` is the public endpoint identity while ``work``
             # is the internal dispatch branch. Keep the public label in
             # diagnostics so a failed Work request is not misreported as a
@@ -13278,6 +13638,7 @@ async def _handle_traework_custom(
         messages,
         options,
         requested_session_id=descriptor.session_id,
+        requested_model=descriptor.model,
     )
     # These values are deliberately set after session binding. The lease owns
     # the account/JWT; the custom model's Bearer key must never replace it.
@@ -13426,6 +13787,7 @@ async def handle_chat(req: Request):
         messages,
         options,
         requested_session_id=requested_session_id,
+        requested_model=model,
     )
     tracker = _UsageTracker(model, req.url.path, stream, options, messages)
     tracker.request_id = request_id
@@ -13512,6 +13874,7 @@ async def handle_responses(req: Request):
         messages,
         options,
         requested_session_id=str(options.get("session_id") or options.get("sessionId") or ""),
+        requested_model=context.model,
     )
     stream = bool(body.get("stream", False))
     tracker = _UsageTracker(context.model, req.url.path, stream, options, messages)
@@ -13617,6 +13980,7 @@ async def handle_anthropic_messages(req: Request):
         messages,
         options,
         requested_session_id=_request_session_hint(req, body),
+        requested_model=model,
     )
     stream = bool(body.get("stream", False))
     tracker = _UsageTracker(model, req.url.path, stream, options, messages)

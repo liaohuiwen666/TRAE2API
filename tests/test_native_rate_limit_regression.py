@@ -59,6 +59,16 @@ class NativeRateLimitClassificationTests(unittest.TestCase):
 
 
 class NativeRateLimitChainTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self):
+        # The 3004 retry path parks the rate-limited account in the 1.3.0
+        # module-global cooldown/pacing tables.  Clear them so later tests
+        # start from a healthy account instead of inheriting the cooldown.
+        main_module._CHAT_ACCOUNT_COOLDOWNS.clear()
+        main_module._CHAT_PACING_LAST_STARTED.clear()
+        main_module._CHAT_PACING_MULTIPLIER.clear()
+        main_module._CHAT_PACING_LOCKS.clear()
+        main_module._CHAT_REQUEST_GATES.clear()
+
     def _options(self):
         return {
             "_account_id": "account-a",
