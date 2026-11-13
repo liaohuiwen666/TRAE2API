@@ -1,10 +1,17 @@
-<p align="center"><img src="docs/logo.svg" width="96" height="96" alt="Trae2api-cn"></p>
+<p align="center"><img src="docs/logo.svg" width="96" height="96" alt="TRAE2API"></p>
 
-# Trae2api-cn
+# TRAE2API
 
 Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通道包装成 OpenAI 兼容 API（Chat Completions + Responses），支持调用方工具调用、thinking 分离输出、思考强度映射、多账号并发轮询、每日签到和积分消费记录，可直接接入 Codex、new-api 和各类 OpenAI SDK。
 
+**独立版本 v1.1.0，基于 [autumnsentiment/trae2api-cn](https://github.com/autumnsentiment/trae2api-cn)（MIT）二次开发，新增随机签到与分账号代理（见下）。**
+
 **仅供学习使用。请勿用于商业用途。**
+
+## 1.1.0 新增
+
+- **随机签到**：每天在窗口内给每个账号分配一个随机签到时间点，代替原来的固定时间签到。默认关闭（保持原版行为），开启方式见配置 `TRAE_CHECKIN_SCHEDULE_ENABLED`。窗口默认北京时间 06:00–21:00（`TRAE_CHECKIN_WINDOW_START` / `TRAE_CHECKIN_WINDOW_END`），任意两个账号签到时间至少间隔 `TRAE_CHECKIN_MIN_GAP_SECONDS`（默认 600 秒）；窗口装不下时自动压缩并写 warning 日志。每日计划保存在 `data/checkin_plan.json`，当天中途新增的账号顺延到次日。签到失败的账号保持待签状态，下次继续尝试，不会误标为已签到。
+- **分账号代理**：每个账号可单独配置上游出口代理，账号的所有上游请求都走该代理；不配置则保持原版行为。控制台账号页可直接编辑（面板显示已脱敏）。代理配置错误时请求直接失败，绝不回退直连。管理接口 `POST /api/accounts/proxy` 需要鉴权（`RELAY_API_KEYS` 中的 key，Bearer 或 x-api-key），未鉴权返回 401。
 
 ## 特点
 
@@ -21,6 +28,8 @@ Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通
 - 自动路由开关：工具或图片请求走 IDE Agent，纯文字聊天走 Remote；工具请求不会回落到不支持调用方工具的 Remote/Work 传输
 - 多账号：网页 OAuth 登录、手动添加凭证、账号模型请求开关（不影响签到）、顺序轮询 / 积分优先轮询、每账号并发槽位与排队
 - 每日签到：一键签到、定时自动签到（控制台开关 + 每日时间，北京时间）、9074 风控自动换设备 ID 并退避重试、后台错峰自动重试
+- 随机签到（v1.1.0）：见上；默认关闭，需 `TRAE_CHECKIN_SCHEDULE_ENABLED=1` 开启
+- 分账号代理（v1.1.0）：见上；每个账号独立配置出口代理，代理故障时失败不回退直连
 - 积分与消费记录：统一显示通用积分，按请求记录 tokens、单次积分、状态、思考强度、上下文模式及工具调用
 - 自动任务模型路由：`model=auto` 时，简单请求使用 `deepseek-v4.1-flash`，工具/代码/文件/图片/长上下文请求尝试使用 `6.1sol`，两者默认思考强度为 `ultra`；显式模型请求保持不变
 - 网页控制台：账号与签到、消费记录、轮询与设置、模型连通性测试（可选端点、工具探针和思考强度）
@@ -71,32 +80,9 @@ helper 使用 `pip install -r requirements-native.txt`。Linux relay 镜像只�
 
 ## Docker 部署
 
-### 使用 GitHub 发布镜像（推荐）
+### 从源码构建（当前推荐）
 
-每个 `v*.*.*` 标签会由 GitHub Actions 自动完成测试、源码包发布和
-GHCR 镜像构建。也可以在仓库的 **Actions → Release and container image →
-Run workflow** 手动执行，默认会构建 `v1.0.11`。部署机器不需要安装 Python、
-Node 或本项目源码，只需要 Docker、Docker Compose 和一个 `.env` 文件：
-
-```bash
-cp .env.example .env
-docker pull ghcr.io/autumnsentiment/trae2api-cn:latest
-docker compose -f docker-compose.image.yml up -d
-```
-
-镜像以公开 GHCR 包发布，支持 `linux/amd64` 和 `linux/arm64`，无需登录即可
-拉取。需要固定版本时，把 `docker-compose.image.yml` 中的 `:latest` 改为发布页的
-版本标签，例如 `:1.0.11`。更新已有部署时执行
-`docker compose -f docker-compose.image.yml pull`，再执行
-`docker compose -f docker-compose.image.yml up -d`。
-
-预构建镜像的 Compose 文件不依赖外部 `new-api` 网络。如果 new-api 也在 Docker
-中，可通过宿主地址访问 relay，或显式把两者加入同一网络。宿主端口由
-`RELAY_PORT` 控制；容器监听端口由 `.env` 的 `PORT` 控制，两者默认都是 `8000`。
-
-### 从源码构建（开发或离线场景）
-
-源码构建仍可用于开发和没有外网的部署环境：
+本仓库暂未发布预构建镜像，请从源码构建部署：
 
 ```bash
 cp .env.example .env
@@ -179,6 +165,7 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_CHECKIN_9074_RETRY_SECONDS` | `60` | 上游返回业务码 9074 后提示的最短重试等待时间；relay 不会立即重复 claim |
 | `TRAE_CHECKIN_9074_MAX_BACKOFF_SECONDS` | `3600` | 连续 9074 指数退避的等待上限（秒） |
 | `TRAE_CHECKIN_AUTO_RETRY_INTERVAL_SECONDS` | `60` | 后台自动错峰重试的扫描间隔（秒），到点自动 claim 冷却到期的账号 |
+| `TRAE_CHECKIN_SCHEDULE_ENABLED` | `0` | 随机签到总开关；`1` 开启后每天按窗口生成随机签到计划，默认关闭（原版固定时间签到行为不变） |
 | `TRAE_CHECKIN_WINDOW_START` | `06:00` | 随机签到窗口开始（北京时间）；每天窗口内给每个账号分配一个随机签到时间点 |
 | `TRAE_CHECKIN_WINDOW_END` | `21:00` | 随机签到窗口结束（北京时间） |
 | `TRAE_CHECKIN_MIN_GAP_SECONDS` | `600` | 任意两个账号随机签到时间点的最小间隔；窗口装不下时自动压缩并写 warning 日志 |
@@ -509,5 +496,7 @@ sudo bash scripts/backup_runtime.sh
 MIT License
 
 Copyright (c) 2026 autumnsentiment
+
+本仓库基于 autumnsentiment/trae2api-cn 二次开发，新增随机签到与分账号代理（v1.1.0）。
 
 本项目仅用于学习和研究目的。使用本项目产生的任何后果由使用者自行承担。
