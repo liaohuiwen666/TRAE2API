@@ -1506,7 +1506,7 @@ def web_origin() -> str:
     """Return the browser Origin/Referer matching the current web upstream."""
     base = remote_base_url().lower()
     if "core-normal.trae.cn" in base or "trae-api-cn" in base or "mchost.guru" in base:
-        return "https://solo.trae.cn"
+        return "https://work.trae.cn"
     return "https://solo.trae.ai"
 
 

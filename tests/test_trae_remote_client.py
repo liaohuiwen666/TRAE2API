@@ -2553,7 +2553,7 @@ class RemoteClientTests(unittest.TestCase):
             self.assertIn("trae-api-cn", trae_remote_client.base_url())
             headers = trae_remote_client.build_headers("jwt")
         self.assertEqual(headers["x-user-region"], "CN")
-        self.assertIn("solo.trae.cn", headers["referer"])
+        self.assertIn("work.trae.cn", headers["referer"])
 
     def test_bare_trae_host_is_repaired_with_remote_path(self):
         """A host-only base must not 404 every chat_sessions/models call (#9)."""
