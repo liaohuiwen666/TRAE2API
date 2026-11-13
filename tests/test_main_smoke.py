@@ -1111,7 +1111,7 @@ class UsageRecordTests(unittest.TestCase):
                 record = main_module._USAGE_HISTORY[0]
                 self.assertEqual(record["credits_consumed"], 0.92)
                 self.assertEqual(record["credits_source"], "session_usage")
-                turn_usage.assert_awaited_once_with("turn-1", "bound-token")
+                turn_usage.assert_awaited_once_with("turn-1", "bound-token", account_id="acct-1")
                 self.assertEqual(credit_snapshot.await_count, 1)
             finally:
                 main_module._USAGE_HISTORY = original_history
@@ -1472,7 +1472,7 @@ class UsageRecordTests(unittest.TestCase):
                 self.assertEqual(record["credits_consumed"], 0.44)
                 self.assertEqual(record["credits_source"], "session_usage")
                 turn_usage.assert_awaited_once_with(
-                    "turn-concurrent", "bound-token"
+                    "turn-concurrent", "bound-token", account_id="acct-shared"
                 )
                 self.assertEqual(credit_snapshot.await_count, 1)
             finally:
@@ -1752,7 +1752,7 @@ class UsageRecordTests(unittest.TestCase):
                 )
                 self.assertEqual(send_raw.await_count, 2)
                 turn_usage.assert_awaited_once_with(
-                    "turn-second", "bound-token"
+                    "turn-second", "bound-token", account_id="acct-raw"
                 )
                 record = next(
                     item
@@ -1841,7 +1841,7 @@ class UsageRecordTests(unittest.TestCase):
             started = asyncio.Event()
             stopped = asyncio.Event()
 
-            async def pending_snapshot(_token):
+            async def pending_snapshot(_token, *args, **kwargs):
                 started.set()
                 try:
                     await asyncio.Future()

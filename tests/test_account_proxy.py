@@ -7,12 +7,13 @@ accounts keep the original no-proxy client construction.
 
 import tempfile
 import unittest
+import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from src import auth, main as main_module
+from src import auth, main as main_module, trae_client
 
 
 class ProxyValidationTests(unittest.TestCase):
@@ -36,6 +37,7 @@ class ProxyValidationTests(unittest.TestCase):
             "ftp://proxy:21",
             "not-a-url",
             "http://",
+            "http://host",
             "http://host:99999",
             "http://host:notaport",
             "socks4://host:1080",
@@ -96,12 +98,15 @@ class ProxyStoreTests(unittest.TestCase):
     def test_kwargs_shape(self):
         self.assertEqual(auth.proxy_httpx_kwargs("acc-2"), {"proxy": "socks5://old:1080"})
         self.assertEqual(auth.proxy_httpx_kwargs("acc-1"), {})
-        self.assertEqual(auth.proxy_httpx_kwargs(""), {})
+        with self.assertRaises(auth.AccountProxyConfigurationError):
+            auth.proxy_httpx_kwargs("")
 
-    def test_corrupt_stored_proxy_falls_back_to_direct(self):
+    def test_corrupt_stored_proxy_fails_closed(self):
         auth._accounts["acc-1"]["proxy"] = "ftp://broken"
-        self.assertEqual(auth.get_account_proxy("acc-1"), "")
-        self.assertEqual(auth.proxy_httpx_kwargs("acc-1"), {})
+        with self.assertRaises(auth.AccountProxyConfigurationError):
+            auth.get_account_proxy("acc-1")
+        with self.assertRaises(auth.AccountProxyConfigurationError):
+            auth.proxy_httpx_kwargs("acc-1")
 
     def test_persisted_in_accounts_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -121,6 +126,34 @@ class ProxyStoreTests(unittest.TestCase):
         self.assertTrue(rows["acc-1"]["has_proxy"])
         self.assertFalse(rows["acc-2"]["has_proxy"] is False)  # acc-2 has one
         self.assertNotIn("secret", str(rows))
+
+    def test_malformed_stored_proxy_does_not_break_listing(self):
+        auth._accounts["acc-1"]["proxy"] = "http://host:notaport"
+        rows = {row["id"]: row for row in auth.list_accounts()}
+        self.assertEqual(rows["acc-1"]["proxy"], "invalid")
+        self.assertFalse(rows["acc-1"]["has_proxy"])
+
+    def test_accounts_without_proxy_keep_legacy_shape(self):
+        rows = {row["id"]: row for row in auth.list_accounts()}
+        self.assertNotIn("proxy", rows["acc-1"])
+        self.assertNotIn("has_proxy", rows["acc-1"])
+
+    def test_alias_resolves_to_the_configured_account_proxy(self):
+        auth._accounts["acc-1"].update(
+            {
+                "user_id": "stored-user",
+                "provider_specific": {"webId": "jwt-user"},
+                "proxy": "http://proxy:8080",
+            }
+        )
+        self.assertEqual(
+            auth.get_account_proxy("jwt-user"), "http://proxy:8080"
+        )
+
+    def test_unresolved_identity_fails_closed_when_proxy_is_configured(self):
+        auth._accounts["acc-1"]["proxy"] = "http://proxy:8080"
+        with self.assertRaises(auth.AccountProxyConfigurationError):
+            auth.get_account_proxy("unknown-user")
 
 
 class ProxyApiTests(unittest.TestCase):
@@ -146,6 +179,22 @@ class ProxyApiTests(unittest.TestCase):
         self.assertEqual(body["proxy"], "socks5://127.0.0.1:1080")
         self.assertTrue(body["has_proxy"])
         self.assertEqual(auth.get_account_proxy("acc-1"), "socks5://127.0.0.1:1080")
+
+    def test_proxy_mutation_requires_api_key_when_configured(self):
+        with patch.object(main_module, "API_KEYS", ["proxy-key"]):
+            rejected = self.client.post(
+                "/api/accounts/proxy",
+                json={"account_id": "acc-1", "proxy": "http://p:8080"},
+            )
+            with patch.object(auth, "_save_accounts"):
+                accepted = self.client.post(
+                    "/api/accounts/proxy",
+                    json={"account_id": "acc-1", "proxy": "http://p:8080"},
+                    headers={"Authorization": "Bearer proxy-key"},
+                )
+        self.assertEqual(rejected.status_code, 401)
+        self.assertEqual(accepted.status_code, 200)
+        self.assertTrue(accepted.json()["success"])
 
     def test_clear_via_api(self):
         with patch.object(auth, "_save_accounts"):
@@ -201,6 +250,7 @@ class ProxyEgressTests(unittest.TestCase):
     def test_async_client_uses_proxy(self):
         with (
             patch.object(auth, "get_account_record", return_value={"proxy": "http://p:8080"}),
+            patch.object(auth, "resolve_model_account_id", return_value="acc-x"),
             patch("httpx.AsyncClient") as factory,
         ):
             kwargs = auth.proxy_httpx_kwargs("acc-x")
@@ -212,6 +262,7 @@ class ProxyEgressTests(unittest.TestCase):
     def test_direct_client_unchanged(self):
         with (
             patch.object(auth, "get_account_record", return_value={}),
+            patch.object(auth, "resolve_model_account_id", return_value="acc-x"),
             patch("httpx.AsyncClient") as factory,
         ):
             kwargs = auth.proxy_httpx_kwargs("acc-x")
@@ -219,6 +270,65 @@ class ProxyEgressTests(unittest.TestCase):
 
             httpx.AsyncClient(timeout=30, **kwargs)
             factory.assert_called_once_with(timeout=30)
+
+    def test_credit_lookup_uses_explicit_stored_account_id_for_proxy(self):
+        seen_accounts = []
+
+        class Response:
+            status_code = 200
+            text = "{}"
+
+            def json(self):
+                return {"code": 0}
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+        def proxy_kwargs(account_id):
+            seen_accounts.append(account_id)
+            return {"proxy": "http://proxy:8080"}
+
+        with (
+            patch.object(trae_client.auth, "proxy_httpx_kwargs", side_effect=proxy_kwargs),
+            patch.object(trae_client.httpx, "AsyncClient", return_value=Client()),
+        ):
+            asyncio.run(
+                trae_client.fetch_account_credits(
+                    "opaque-token", account_id="stored-account"
+                )
+            )
+        self.assertEqual(seen_accounts, ["stored-account"])
+
+    def test_usage_tracker_keeps_proxy_bound_stored_account_id(self):
+        """JWT billing identity must not replace the proxy-routing key."""
+
+        with (
+            patch.object(main_module, "_account_has_configured_proxy", return_value=True),
+            patch.object(main_module, "_account_id_from_token", return_value="jwt-owner"),
+        ):
+            tracker = main_module._UsageTracker(
+                "model",
+                "/v1/chat/completions",
+                False,
+                {
+                    "_account_id": "stored-account",
+                    "_billing_id": "jwt-owner",
+                    "_auth_token": "opaque-token",
+                },
+            )
+        try:
+            self.assertEqual(tracker.account_id, "stored-account")
+            self.assertEqual(tracker.billing_id, "jwt-owner")
+        finally:
+            if tracker._credit_snapshot_started:
+                main_module._end_credit_snapshot(tracker.account_id)
 
 
 if __name__ == "__main__":

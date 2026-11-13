@@ -47,7 +47,7 @@ class SessionUsageTests(unittest.IsolatedAsyncioTestCase):
                 session_usage.enrich_remote_events(self.events(), "test-token", "turn-123"),
                 "m",
             )
-        fetch.assert_awaited_once_with("turn-123", "test-token")
+        fetch.assert_awaited_once_with("turn-123", "test-token", account_id="")
         self.assertEqual(result["choices"][0]["message"]["content"], "complete answer")
         self.assertEqual(result["usage"], {
             "prompt_tokens": 300, "completion_tokens": 4, "total_tokens": 304,
@@ -138,7 +138,7 @@ class SessionUsageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancellation_propagates_and_closes_source(self):
         entered = asyncio.Event()
-        async def pending(*args):
+        async def pending(*args, **kwargs):
             entered.set()
             await asyncio.Event().wait()
         with patch.object(session_usage.trae_client, "fetch_session_usage", AsyncMock(side_effect=pending)):
@@ -198,7 +198,7 @@ class SessionUsageTests(unittest.IsolatedAsyncioTestCase):
         original = sse._map_usage(self.usage)
         with patch.object(session_usage.trae_client, "fetch_session_usage", fetch):
             result = await enrich(original)
-        fetch.assert_awaited_once_with("isolated-turn", "bound-token")
+        fetch.assert_awaited_once_with("isolated-turn", "bound-token", account_id="")
         self.assertEqual(metadata, {"usage_turn_id": "isolated-turn"})
         self.assertEqual(result["prompt_tokens_details"]["cached_tokens"], 240)
         self.assertEqual(original["prompt_tokens_details"]["cached_tokens"], 0)

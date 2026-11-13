@@ -1015,6 +1015,10 @@ from urllib.parse import urlsplit as _urlsplit
 _PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
 
+class AccountProxyConfigurationError(RuntimeError):
+    """A configured account proxy cannot be used safely."""
+
+
 def validate_account_proxy(value) -> str:
     """Normalize a proxy URL, raising ValueError for malformed input."""
     text = str(value or "").strip()
@@ -1035,7 +1039,9 @@ def validate_account_proxy(value) -> str:
         port = parts.port
     except ValueError as exc:
         raise ValueError("proxy URL has an invalid port") from exc
-    if port is not None and not (1 <= port <= 65535):
+    if port is None:
+        raise ValueError("proxy URL must include a port")
+    if not (1 <= port <= 65535):
         raise ValueError("proxy port must be between 1 and 65535")
     return text
 
@@ -1046,30 +1052,70 @@ def mask_account_proxy(value) -> str:
     if not text:
         return ""
     try:
+        # Validate first so corrupted persisted values are never displayed as
+        # usable proxies.  Accessing ``parts.port`` can itself raise ValueError.
+        validate_account_proxy(text)
         parts = _urlsplit(text)
+        host = parts.hostname or ""
+        port = parts.port
     except ValueError:
         return "invalid"
-    host = parts.hostname or ""
-    port = parts.port
     suffix = f":{port}" if port else ""
     auth_mark = "***@" if parts.username else ""
     return f"{parts.scheme}://{auth_mark}{host}{suffix}"
 
 
 def get_account_proxy(account_id: str) -> str:
-    """Return the configured upstream proxy URL for an account, or ''."""
-    account_id = str(account_id or "").strip()
-    if not account_id:
+    """Return the configured upstream proxy URL, refusing unsafe fallback.
+
+    Aliases from a JWT/user identity resolve to the account-store key before
+    lookup.  If an account proxy is configured but an identity cannot be
+    resolved, sending the request direct could disclose that account's token
+    and source address; fail closed instead.
+    """
+    requested_id = str(account_id or "").strip()
+    with _STORE_LOCK:
+        any_proxy_configured = any(
+            str(record.get("proxy") or "").strip()
+            for record in _accounts.values()
+        )
+    if not requested_id:
+        if any_proxy_configured:
+            logger.error(
+                "auth: refusing direct egress without an account identity while "
+                "account proxies are configured"
+            )
+            raise AccountProxyConfigurationError(
+                "account proxy identity is required"
+            )
         return ""
-    rec = get_account_record(account_id)
+    canonical_id = resolve_model_account_id(requested_id)
+    if not canonical_id:
+        if any_proxy_configured:
+            logger.error(
+                "auth: refusing direct egress for unresolved account identity=%s "
+                "while account proxies are configured",
+                requested_id,
+            )
+            raise AccountProxyConfigurationError(
+                "account proxy identity could not be resolved"
+            )
+        return ""
+    rec = get_account_record(canonical_id)
     proxy = str(rec.get("proxy") or "").strip()
     if not proxy:
         return ""
     try:
         return validate_account_proxy(proxy)
-    except ValueError:
-        logger.warning("auth: account=%s has invalid proxy, using direct", account_id)
-        return ""
+    except ValueError as exc:
+        logger.error(
+            "auth: refusing direct egress for account=%s with invalid proxy: %s",
+            canonical_id,
+            exc,
+        )
+        raise AccountProxyConfigurationError(
+            f"account {canonical_id} has an invalid configured proxy"
+        ) from exc
 
 
 def set_account_proxy(account_id: str, proxy) -> bool:
@@ -1793,13 +1839,11 @@ def list_accounts() -> list[dict]:
                 dict(account_credits) if isinstance(account_credits, dict) else {}
             )
             entitlement = _account_entitlement_snapshot(rec)
-            result.append({
+            row = {
                 'id': aid,
                 'user_id': rec.get('user_id', aid),
                 'label': rec.get('label', ''),
                 'source': rec.get('source', ''),
-                'proxy': mask_account_proxy(rec.get('proxy', '')),
-                'has_proxy': bool(str(rec.get('proxy') or '').strip()),
                 'has_token': bool(rec.get('token')),
                 'is_active': aid == _active_account,
                 'is_valid': _record_valid(rec),
@@ -1849,7 +1893,14 @@ def list_accounts() -> list[dict]:
                         - max(0, int(_MODEL_ACCOUNT_INFLIGHT.get(aid, 0))),
                     ),
                 },
-            })
+            }
+            # Keep legacy account rows byte-for-byte shape-compatible when
+            # this optional feature is not configured for that account.
+            if str(rec.get('proxy') or '').strip():
+                masked_proxy = mask_account_proxy(rec.get('proxy', ''))
+                row['proxy'] = masked_proxy
+                row['has_proxy'] = masked_proxy != 'invalid'
+            result.append(row)
         return result
 
 

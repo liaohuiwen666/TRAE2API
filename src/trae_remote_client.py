@@ -651,6 +651,7 @@ async def _resolve_model_config(
     model_name: str,
     *,
     token: str,
+    account_id: str,
     user_id: str,
     provider_data: Mapping[str, Any],
     agent_type: str,
@@ -665,6 +666,8 @@ async def _resolve_model_config(
         "user_id_override": user_id,
         "provider_specific": provider_data,
     }
+    if account_id:
+        kwargs["account_id"] = account_id
     tier_aware = force_agent_type or _callable_accepts_keyword(resolver, "agent_type")
     if tier_aware:
         kwargs["agent_type"] = agent_type
@@ -677,6 +680,9 @@ async def _resolve_model_config(
         # Retry only the precise unsupported-keyword case; never mask a
         # TypeError raised by the resolver's own implementation.
         message = str(exc)
+        if "account_id" in message and "keyword" in message:
+            kwargs.pop("account_id", None)
+            return await resolver(model_name, **kwargs)
         if not tier_aware or "agent_type" not in message or "keyword" not in message:
             raise
         kwargs.pop("agent_type", None)
@@ -862,6 +868,7 @@ async def create_session(
         custom_model = await _resolve_model_config(
             model_name,
             token=token,
+            account_id=str((options or {}).get("_account_id") or ""),
             user_id=bound_user_id,
             provider_data=provider_data,
             agent_type=agent_type,

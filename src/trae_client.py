@@ -350,6 +350,7 @@ async def _cached_model_catalog(
     source: str,
     token: str,
     *,
+    account_id: str = "",
     user_id_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     agent_type: str = "",
@@ -373,6 +374,11 @@ async def _cached_model_catalog(
     if pending is None:
         async def fetch():
             kwargs: dict[str, Any] = {}
+            # The stored account key is authoritative for proxy selection.
+            # Older callers continue to let the transport resolve the JWT
+            # identity through auth's alias resolver.
+            if account_id:
+                kwargs["account_id"] = account_id
             if provider_specific is not None:
                 kwargs["provider_specific"] = provider_specific
             if source == "solo":
@@ -382,16 +388,33 @@ async def _cached_model_catalog(
                 try:
                     configs = await _fetch_solo_model_configs(token_override=token, **kwargs)
                 except TypeError as exc:
-                    if "raw_chat_function" not in str(exc):
+                    # Third-party catalog hooks may predate either optional
+                    # selector.  Retain that extension point while the built-
+                    # in transport receives the canonical account id.
+                    if "account_id" in str(exc):
+                        kwargs.pop("account_id", None)
+                        configs = await _fetch_solo_model_configs(
+                            token_override=token, **kwargs
+                        )
+                    elif "raw_chat_function" not in str(exc):
                         raise
-                    kwargs.pop("raw_chat_function", None)
-                    configs = await _fetch_solo_model_configs(token_override=token, **kwargs)
+                    else:
+                        kwargs.pop("raw_chat_function", None)
+                        configs = await _fetch_solo_model_configs(
+                            token_override=token, **kwargs
+                        )
             else:
                 if agent_type:
                     kwargs["agent_type"] = agent_type
                 if raw_chat_function:
                     kwargs["raw_chat_function"] = raw_chat_function
-                configs = await _fetch_web_model_configs(token, **kwargs)
+                try:
+                    configs = await _fetch_web_model_configs(token, **kwargs)
+                except TypeError as exc:
+                    if "account_id" not in str(exc):
+                        raise
+                    kwargs.pop("account_id", None)
+                    configs = await _fetch_web_model_configs(token, **kwargs)
             if configs:
                 _WEB_MODEL_CACHE[cache_key] = (time.time(), copy.deepcopy(configs))
             else:
@@ -524,6 +547,7 @@ async def _resolve_request_model_name(
     model: str,
     *,
     token: str = "",
+    account_id: str = "",
     user_id: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
 ) -> str:
@@ -553,6 +577,7 @@ async def _resolve_request_model_name(
         config = await resolve_model_config(
             requested,
             token_override=token,
+            account_id=account_id,
             user_id_override=user_id,
             provider_specific=provider_specific,
         )
@@ -933,7 +958,9 @@ async def _post_checkin(
             data["_error_code"] = code
         return data
 
-async def fetch_account_credits(token: str = "", req_source: int = 1) -> dict:
+async def fetch_account_credits(
+    token: str = "", req_source: int = 1, *, account_id: str = ""
+) -> dict:
     """Fetch account credits/entitlement usage from the IDE pay API.
 
     req_source=1 returns general IDE credits, req_source=2 returns work-specific credits.
@@ -947,11 +974,13 @@ async def fetch_account_credits(token: str = "", req_source: int = 1) -> dict:
     base = os.environ.get("TRAE_PAY_API_HOST", TRAE_PAY_API_HOST).rstrip("/")
     url = f"{base}/trae/api/v2/pay/ide_user_ent_usage"
     payload = {"require_usage": True, "req_source": req_source}
-    account_id = _checkin_identity(token)
+    account_id = str(account_id or _checkin_identity(token) or "")
     async with httpx.AsyncClient(
         timeout=30, **auth.proxy_httpx_kwargs(account_id)
     ) as client:
-        resp = await client.post(url, json=payload, headers=build_checkin_headers(token))
+        resp = await client.post(
+            url, json=payload, headers=build_checkin_headers(token, account_id)
+        )
         text = resp.text
         if resp.status_code != 200:
             raise RuntimeError(f"Trae pay credits [{resp.status_code}]: {text[:500]}")
@@ -963,7 +992,7 @@ async def fetch_account_credits(token: str = "", req_source: int = 1) -> dict:
             raise RuntimeError(f"Trae pay credits: {data.get('message') or data}")
         return data
 
-async def fetch_user_info(token: str = "") -> dict:
+async def fetch_user_info(token: str = "", *, account_id: str = "") -> dict:
     """Fetch the upstream profile (ScreenName/UserID) like the Trae client.
 
     The client posts to ``/cloudide/api/v3/trae/GetUserInfo`` with the JWT in
@@ -977,7 +1006,8 @@ async def fetch_user_info(token: str = "") -> dict:
     url = f"{base}/cloudide/api/v3/trae/GetUserInfo"
     headers = {"Content-Type": "application/json", "x-cloudide-token": token}
     async with httpx.AsyncClient(
-        timeout=20, **auth.proxy_httpx_kwargs(_checkin_identity(token))
+        timeout=20,
+        **auth.proxy_httpx_kwargs(account_id or _checkin_identity(token)),
     ) as client:
         resp = await client.post(url, json={"ReqSource": "IDE"}, headers=headers)
         text = resp.text
@@ -1146,18 +1176,18 @@ def parse_account_credits(data: dict, available_endpoint_filter: int = None) -> 
     }
 
 
-async def fetch_account_work_credits(token: str = "") -> dict:
+async def fetch_account_work_credits(token: str = "", *, account_id: str = "") -> dict:
     """Fetch work-specific account credits.
 
     req_source=2 returns ALL packs (same as req_source=0), not just work.
     So we fetch req_source=0 and filter by available_endpoint=1 in parse.
     Returns the raw API response for downstream parse_account_credits(data, ae_filter=1).
     """
-    return await fetch_account_credits(token, req_source=0)
+    return await fetch_account_credits(token, req_source=0, account_id=account_id)
 
-async def fetch_account_total_credits(token: str = "") -> dict:
+async def fetch_account_total_credits(token: str = "", *, account_id: str = "") -> dict:
     """Fetch all account credits (all packs, both general and work)."""
-    return await fetch_account_credits(token, req_source=0)
+    return await fetch_account_credits(token, req_source=0, account_id=account_id)
 
 
 def _session_token_usage(data: Mapping[str, Any], session_id: str) -> dict:
@@ -1237,6 +1267,7 @@ async def fetch_session_usage(
     session_id: str,
     token: str = "",
     *,
+    account_id: str = "",
     base_url: str = "",
 ) -> dict:
     """Read the billable usage for one completed TraeWork turn.
@@ -1262,7 +1293,8 @@ async def fetch_session_usage(
     timeout = float(os.environ.get("TRAE_USAGE_QUERY_TIMEOUT_SECONDS", "15") or "15")
     timeout = max(1.0, min(timeout, 60.0))
     async with httpx.AsyncClient(
-        timeout=timeout, **auth.proxy_httpx_kwargs(_checkin_identity(token))
+        timeout=timeout,
+        **auth.proxy_httpx_kwargs(account_id or _checkin_identity(token)),
     ) as client:
         response = await client.post(
             url,
@@ -2048,6 +2080,7 @@ async def _fetch_web_model_configs(
     provider_specific: Optional[Mapping[str, Any]] = None,
     agent_type: str = "",
     raw_chat_function: str = "",
+    account_id: str = "",
 ) -> dict[str, dict]:
     """Fetch the same model list used by the Trae web client."""
     base = remote_base_url()
@@ -2064,7 +2097,7 @@ async def _fetch_web_model_configs(
         async with httpx.AsyncClient(
             headers=build_web_headers(token, header_options),
             timeout=30,
-            **auth.proxy_httpx_kwargs(_checkin_identity(token)),
+            **auth.proxy_httpx_kwargs(account_id or _checkin_identity(token)),
         ) as client:
             resp = await client.get(url)
             if resp.status_code != 200:
@@ -2239,6 +2272,7 @@ async def _fetch_solo_model_configs(
     provider_specific: Optional[Mapping[str, Any]] = None,
     user_id_override: str = "",
     raw_chat_function: str = "solo_work_lite",
+    account_id: str = "",
 ) -> dict[str, dict]:
     """Fetch the native Solo catalog from ``get_detail_param``.
 
@@ -2303,7 +2337,8 @@ async def _fetch_solo_model_configs(
         )
         timeout = max(1.0, min(timeout, 20.0))
         async with httpx.AsyncClient(
-            timeout=timeout, **auth.proxy_httpx_kwargs(_checkin_identity(token))
+            timeout=timeout,
+            **auth.proxy_httpx_kwargs(account_id or _checkin_identity(token)),
         ) as client:
             resp = await client.post(url, headers=headers, json=body)
             if resp.status_code != 200:
@@ -2465,6 +2500,7 @@ async def resolve_traecode_model_config(
     model_name: str,
     *,
     token_override: str = "",
+    account_id: str = "",
     user_id_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     max_mode: bool = False,
@@ -2485,6 +2521,7 @@ async def resolve_traecode_model_config(
         return None
     configs = await _cached_model_catalog(
         "solo", token,
+        account_id=account_id,
         provider_specific=provider_specific,
         user_id_override=str(user_id_override or ""),
         raw_chat_function=raw_chat_function,
@@ -2566,6 +2603,7 @@ async def _get_web_custom_model(
     model_name: str,
     *,
     token_override: str = "",
+    account_id: str = "",
     user_id_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     agent_type: str = "",
@@ -2582,7 +2620,7 @@ async def _get_web_custom_model(
         return None
     token = token_override or auth.get_token()
     configs = await _cached_model_catalog(
-        "web", token, user_id_override=user_id_override,
+        "web", token, account_id=account_id, user_id_override=user_id_override,
         provider_specific=provider_specific, agent_type=agent_type,
         raw_chat_function=raw_chat_function,
     )
@@ -2594,7 +2632,7 @@ async def _get_web_custom_model(
     if not found and not agent_type:
         # A warm Remote cache must still allow a later Solo-only lookup.
         solo_configs = await _cached_model_catalog(
-            "solo", token, user_id_override=user_id_override,
+            "solo", token, account_id=account_id, user_id_override=user_id_override,
             provider_specific=provider_specific, raw_chat_function=raw_chat_function,
         )
         for name, config in solo_configs.items():
@@ -2638,6 +2676,7 @@ async def resolve_model_config(
     model_name: str,
     *,
     token_override: str = "",
+    account_id: str = "",
     user_id_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     agent_type: str = "",
@@ -2649,6 +2688,8 @@ async def resolve_model_config(
         "token_override": token_override,
         "user_id_override": user_id_override,
     }
+    if account_id:
+        kwargs["account_id"] = account_id
     if provider_specific is not None:
         kwargs["provider_specific"] = provider_specific
     if agent_type:
@@ -2661,6 +2702,7 @@ async def resolve_model_config(
 async def get_scoped_model_configs(
     *,
     token_override: str = "",
+    account_id: str = "",
     user_id_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     agent_type: str = "",
@@ -2677,13 +2719,13 @@ async def get_scoped_model_configs(
     if not token:
         return {}
     configs = await _cached_model_catalog(
-        "web", token, user_id_override=user_id_override,
+        "web", token, account_id=account_id, user_id_override=user_id_override,
         provider_specific=provider_specific, agent_type=agent_type,
         raw_chat_function=raw_chat_function,
     )
     if not configs and not agent_type:
         configs = await _cached_model_catalog(
-            "solo", token, user_id_override=user_id_override,
+            "solo", token, account_id=account_id, user_id_override=user_id_override,
             provider_specific=provider_specific, raw_chat_function=raw_chat_function,
         )
     return configs
@@ -2741,6 +2783,9 @@ async def create_web_session(
             "user_id_override": bound_user_id,
             "provider_specific": psd,
         }
+        bound_account_id = str(options.get("_account_id") or "").strip()
+        if bound_account_id:
+            lookup_kwargs["account_id"] = bound_account_id
         if agent_type != "solo_agent_remote" or requested_agent_type:
             lookup_kwargs["agent_type"] = agent_type
         raw_function = str(
@@ -3389,6 +3434,7 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
     model_name = await _resolve_request_model_name(
         model,
         token=bound_token,
+        account_id=str(options.get("_account_id") or ""),
         user_id=bound_user_id,
         provider_specific=(
             dict(provider_specific) if isinstance(provider_specific, Mapping) else None
@@ -3413,6 +3459,9 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
             "token_override": bound_token,
             "user_id_override": bound_user_id,
         }
+        bound_account_id = str(options.get("_account_id") or "").strip()
+        if bound_account_id:
+            lookup_kwargs["account_id"] = bound_account_id
         if isinstance(provider_specific, Mapping):
             lookup_kwargs["provider_specific"] = dict(provider_specific)
         try:
@@ -3947,11 +3996,11 @@ async def get_models(force: bool = False) -> list[dict]:
         # replacing or setdefault-ing the full config would discard one
         # catalog's endpoint evidence for that shared model.
         remote_task = _cached_model_catalog(
-            "web", token, user_id_override=bound_user_id,
+            "web", token, account_id=account_id, user_id_override=bound_user_id,
             provider_specific=provider, force=force,
         )
         solo_task = _cached_model_catalog(
-            "solo", token, user_id_override=bound_user_id,
+            "solo", token, account_id=account_id, user_id_override=bound_user_id,
             provider_specific=provider, force=force,
         )
         remote_configs, solo_configs = await asyncio.gather(

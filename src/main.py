@@ -26,6 +26,7 @@ import html as html_mod
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -264,11 +265,41 @@ CHECKIN_AUTO_RETRY_INTERVAL = float(
 )
 # Daily randomized check-in schedule (feature: spread accounts over a window).
 # The existing fixed-time auto checkin above stays independent and unchanged.
+def _checkin_schedule_enabled() -> bool:
+    """Return whether the opt-in random scheduler is explicitly enabled."""
+
+    return (
+        str(os.environ.get("TRAE_CHECKIN_SCHEDULE_ENABLED", "") or "")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+CHECKIN_SCHEDULE_ENABLED = _checkin_schedule_enabled()
 CHECKIN_WINDOW_START = os.environ.get("TRAE_CHECKIN_WINDOW_START", "06:00") or "06:00"
 CHECKIN_WINDOW_END = os.environ.get("TRAE_CHECKIN_WINDOW_END", "21:00") or "21:00"
-CHECKIN_MIN_GAP_SECONDS = float(
-    os.environ.get("TRAE_CHECKIN_MIN_GAP_SECONDS", "600") or "600"
-)
+
+
+def _checkin_min_gap_seconds() -> float:
+    """Read the optional schedule gap without making startup fragile."""
+
+    raw = os.environ.get("TRAE_CHECKIN_MIN_GAP_SECONDS", "600") or "600"
+    try:
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError("not finite")
+        return value
+    except (TypeError, ValueError):
+        logger.warning(
+            "checkin schedule: invalid TRAE_CHECKIN_MIN_GAP_SECONDS=%r; "
+            "using default 600",
+            raw,
+        )
+        return 600.0
+
+
+CHECKIN_MIN_GAP_SECONDS = _checkin_min_gap_seconds()
 CHECKIN_PLAN_PATH = auth.ACCOUNTS_PATH.parent / "checkin_plan.json"
 DEFAULT_REMOTE_BASE_URL = "https://trae-api-cn.mchost.guru/api/remote/v1"
 DEFAULT_WORK_MODEL_GATEWAY_URL = (
@@ -681,7 +712,6 @@ PUBLIC_PATHS = {
     "/api/accounts",
     "/api/accounts/switch",
     "/api/accounts/remove",
-    "/api/accounts/proxy",
     "/api/settings",
     "/api/polling",
     "/api/polling-mode",
@@ -3437,9 +3467,10 @@ async function requestJSON(url,options,timeoutMs){{
     throw new Error('网络请求失败：'+String(e));
   }}finally{{ clearTimeout(timeout); }}
 }}
-async function postJSON(url,payload,timeoutMs){{
+async function postJSON(url,payload,timeoutMs,extraHeaders){{
   try{{
-    var result=await requestJSON(url,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload||{{}})}},timeoutMs||45000);
+    var headers=Object.assign({{'Content-Type':'application/json'}},extraHeaders||{{}});
+    var result=await requestJSON(url,{{method:'POST',headers:headers,body:JSON.stringify(payload||{{}})}},timeoutMs||45000);
     var d=result.data;
     if(!d||typeof d!=='object'||Array.isArray(d)) d={{}};
     d._http_status=result.status; d._http_ok=result.ok;
@@ -3854,6 +3885,22 @@ function toggleAccountProxyEditor(id){{
     if(input) input.focus();
   }}
 }}
+var proxyManagementApiKey='';
+async function saveAccountProxyRequest(payload){{
+  var headers=proxyManagementApiKey
+    ? {{'Authorization':'Bearer '+proxyManagementApiKey}}
+    : undefined;
+  var response=await postJSON('/api/accounts/proxy',payload,30000,headers);
+  if(response._http_status!==401) return response;
+  var entered=window.prompt('请输入 RELAY_API_KEYS 中的 API 密钥以保存账号代理');
+  if(!entered) return response;
+  proxyManagementApiKey=entered.trim();
+  if(!proxyManagementApiKey) return response;
+  return await postJSON(
+    '/api/accounts/proxy', payload, 30000,
+    {{'Authorization':'Bearer '+proxyManagementApiKey}}
+  );
+}}
 async function saveAccountProxy(id){{
   var input=document.getElementById('proxy-input-'+id);
   var btn=document.getElementById('proxy-save-'+id);
@@ -3864,7 +3911,7 @@ async function saveAccountProxy(id){{
   }}
   if(btn) btn.disabled=true;
   try{{
-    var d=await postJSON('/api/accounts/proxy',{{account_id:id,proxy:value}},30000);
+    var d=await saveAccountProxyRequest({{account_id:id,proxy:value}});
     if(!d.success){{ showMsg('account-msg',d.error||'保存代理失败',false); return; }}
     var state=document.getElementById('proxy-state-'+id);
     if(state){{
@@ -6721,11 +6768,15 @@ def _account_id_from_token(token: str) -> str:
     return ""
 
 
-async def _fetch_used_credits(token: str) -> int | float | None:
+async def _fetch_used_credits(
+    token: str, *, account_id: str = ""
+) -> int | float | None:
     if not token:
         return None
     try:
-        raw = await trae_client.fetch_account_total_credits(token)
+        raw = await trae_client.fetch_account_total_credits(
+            token, account_id=account_id
+        )
         parsed = trae_client.parse_account_credits(raw)
         return _number_value(parsed.get("used"))
     except Exception as exc:
@@ -6989,7 +7040,7 @@ def _shared_credit_before_task(account_id: str, token: str) -> asyncio.Task | No
         if existing is not None:
             return existing
         task = _spawn_usage_task(
-            _fetch_used_credits(token),
+            _fetch_used_credits(token, account_id=account_id),
             _USAGE_SNAPSHOT_TASKS,
         )
         if task is not None:
@@ -7328,6 +7379,7 @@ async def _enrich_usage_credits(
                     session_usage = await trae_client.fetch_session_usage(
                         usage_turn_id,
                         token,
+                        account_id=account_id,
                     )
                     credits = _number_value(
                         session_usage.get("credits_consumed")
@@ -7429,7 +7481,7 @@ async def _enrich_usage_credits(
             return
         gate = _credit_settle_gate(account_id)
         if gate is None:
-            after = await _fetch_used_credits(token)
+            after = await _fetch_used_credits(token, account_id=account_id)
             delta = _credit_delta_from_total(account_id, before, after)
             if delta is None:
                 _update_usage_record(
@@ -7454,7 +7506,7 @@ async def _enrich_usage_credits(
             )
             return
         async with gate:
-            after = await _fetch_used_credits(token)
+            after = await _fetch_used_credits(token, account_id=account_id)
             delta = _credit_delta_from_total(account_id, before, after)
             if delta is None:
                 _update_usage_record(
@@ -7511,8 +7563,11 @@ class _UsageTracker:
             # token from the mutable global auth state.
             record = auth.get_account_record(self.account_id)
             self.token = str(record.get("token") or "")
+        bound_proxy_account = bool(self.account_id) and _account_has_configured_proxy(
+            self.account_id
+        )
         token_identity = _account_id_from_token(self.token)
-        if token_identity:
+        if token_identity and not bound_proxy_account:
             # The JWT is the credential that the upstream actually bills. It
             # is authoritative over a stale UI-selected account id.
             if self.account_id and self.account_id != token_identity:
@@ -7522,7 +7577,7 @@ class _UsageTracker:
                     token_identity,
                 )
             self.account_id = token_identity
-        if self.billing_id:
+        if self.billing_id and not bound_proxy_account:
             # billing_id overrides account_id for usage records so the
             # deducted credits are attributed to the token owner.
             self.account_id = self.billing_id
@@ -7641,11 +7696,19 @@ class _UsageTracker:
         token = str(options.get("_auth_token") or "").strip()
         account_id = str(options.get("_account_id") or "").strip()
         billing_id = str(options.get("_billing_id") or "").strip()
+        bound_proxy_account = bool(account_id) and _account_has_configured_proxy(
+            account_id
+        )
         token_identity = _account_id_from_token(token)
-        if token_identity:
+        if token_identity and not bound_proxy_account:
             billing_id = token_identity
             account_id = token_identity
-        elif billing_id:
+        elif token_identity:
+            # Preserve the explicit stored account key for all proxy-bound
+            # upstream credit/session calls, while retaining the token owner
+            # as billing metadata when a caller did not provide one.
+            billing_id = billing_id or token_identity
+        elif billing_id and not bound_proxy_account:
             account_id = billing_id
         if not account_id and token:
             account_id = str(auth.get_active_account_id() or "default")
@@ -8632,7 +8695,12 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
         token = str(auth.get_token() or "").strip()
     _ensure_model_account_enabled(account_id, token)
     token_identity = _account_id_from_token(token)
-    if token_identity:
+    if token_identity and (
+        not account_id or not _account_has_configured_proxy(account_id)
+    ):
+        # Direct accounts retain the legacy JWT-derived identity.  A proxied
+        # account must retain its persisted account key so the web client is
+        # constructed with that account's egress proxy.
         account_id = token_identity
     if not account_id:
         account_id = str(
@@ -8691,9 +8759,7 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
         await _await_session_cleanup(cleanup_task)
 
     try:
-        client = httpx.AsyncClient(
-            timeout=60, **auth.proxy_httpx_kwargs(account_id)
-        )
+        client = httpx.AsyncClient(**_proxy_async_client_kwargs(account_id, 60))
         session_id, message_id = await trae_client.create_web_session(
             client,
             model,
@@ -8794,9 +8860,12 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         token = str(auth.get_token() or "").strip()
     _ensure_model_account_enabled(account_id, token)
     token_identity = _account_id_from_token(token)
-    if token_identity:
+    if token_identity and (
+        not account_id or not _account_has_configured_proxy(account_id)
+    ):
         # The JWT is the identity Trae bills.  It is authoritative if an old
-        # account-store key or UI selection is stale.
+        # account-store key or UI selection is stale for direct accounts. A
+        # proxied account keeps its stored key for proxy routing.
         account_id = token_identity
     if not account_id:
         account_id = str(auth.get_active_account_id() or "default")
@@ -9024,9 +9093,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         ),
     )
     try:
-        client = httpx.AsyncClient(
-            timeout=None, **auth.proxy_httpx_kwargs(account_id)
-        )
+        client = httpx.AsyncClient(**_proxy_async_client_kwargs(account_id, None))
         logger.info(
             "remote create start id=%s account=%s model=%s messages=%d "
             "input_last_chars=%d query_chars=%d",
@@ -9060,7 +9127,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             client = None
             await _await_session_cleanup(asyncio.create_task(failed_client.aclose()))
             client = httpx.AsyncClient(
-                timeout=None, **auth.proxy_httpx_kwargs(account_id)
+                **_proxy_async_client_kwargs(account_id, None)
             )
             remote_options = work_fallback_options(remote_options)
             work_fallback_used = True
@@ -9086,7 +9153,9 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             message_id,
             options=remote_options,
         )
-        event_iter = enrich_remote_events(event_iter, token, message_id)
+        event_iter = enrich_remote_events(
+            event_iter, token, message_id, account_id=account_id
+        )
         if stream:
             async def gen():
                 nonlocal work_fallback_used
@@ -9273,8 +9342,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                             )
                             slot_reacquired = True
                             retry_client = httpx.AsyncClient(
-                                timeout=None,
-                                **auth.proxy_httpx_kwargs(retry_account_id),
+                                **_proxy_async_client_kwargs(retry_account_id, None)
                             )
                             logger.info(
                                 "remote empty retry start id=%s model=%s account=%s",
@@ -9303,7 +9371,10 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                 options=retry_options,
                             )
                             retry_event_iter = enrich_remote_events(
-                                retry_event_iter, retry_token, retry_message_id
+                                retry_event_iter,
+                                retry_token,
+                                retry_message_id,
+                                account_id=retry_account_id,
                             )
                             async for chunk in translate_web_events(
                                 retry_event_iter,
@@ -9420,7 +9491,9 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                 message_id,
                 options=remote_options,
             )
-            fallback_events = enrich_remote_events(fallback_events, token, message_id)
+            fallback_events = enrich_remote_events(
+                fallback_events, token, message_id, account_id=account_id
+            )
             result = await collect_nonstream_web(
                 fallback_events,
                 model,
@@ -10142,6 +10215,57 @@ def _retry_options_for_account(
     return rebound, token, billing_id, provider_specific
 
 
+def _proxy_async_client_kwargs(account_id: str, direct_timeout: Any) -> dict[str, Any]:
+    """Keep direct-client behavior, but bound a proxied connection attempt."""
+
+    proxy_kwargs = auth.proxy_httpx_kwargs(account_id)
+    if not proxy_kwargs:
+        return {"timeout": direct_timeout}
+    # Remote historically used ``timeout=None`` so long-running direct model
+    # streams are unchanged.  A dead per-account proxy must not hold a pool
+    # slot forever, however, so its connect/pool/read/write phases are bounded.
+    return {
+        "timeout": httpx.Timeout(60.0, connect=10.0, pool=10.0),
+        **proxy_kwargs,
+    }
+
+
+def _account_has_configured_proxy(account_id: str) -> bool:
+    """Check raw persisted state without converting a bad proxy to direct."""
+
+    canonical_id = auth.resolve_model_account_id(account_id) or str(account_id or "")
+    record = auth.get_account_record(canonical_id)
+    return bool(str(record.get("proxy") or "").strip())
+
+
+def _is_retryable_proxy_transport_error(error: BaseException, account_id: str) -> bool:
+    """Recognize pre-output failures of an account's configured proxy only."""
+
+    if not _account_has_configured_proxy(account_id):
+        return False
+    if isinstance(error, auth.AccountProxyConfigurationError):
+        return True
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(
+            current,
+            (
+                httpx.ProxyError,
+                httpx.ConnectError,
+                httpx.ConnectTimeout,
+                httpx.ReadTimeout,
+                httpx.WriteTimeout,
+                httpx.PoolTimeout,
+            ),
+        ):
+            return True
+        next_error = current.__cause__ or current.__context__
+        current = next_error if isinstance(next_error, BaseException) else None
+    return False
+
+
 async def _run_web_with_retry(
     messages,
     model,
@@ -10165,12 +10289,21 @@ async def _run_web_with_retry(
                 return await run_web_session(
                     messages, model, stream, attempt_options
                 )
-            except RuntimeError as e:
+            except Exception as e:
                 err = str(e)
-                if "solo_agent_parallel_limit" in err or "429" in err:
+                account_id = str((attempt_options or {}).get("_account_id") or "")
+                if _is_retryable_proxy_transport_error(e, account_id):
+                    reason = "proxy transport failure"
+                elif isinstance(e, RuntimeError) and (
+                    "solo_agent_parallel_limit" in err or "429" in err
+                ):
+                    reason = "429 parallel limit"
+                else:
+                    raise
+                if reason:
                     if attempt_index + 1 >= attempts:
                         break
-                    logger.warning("web 429 parallel limit, rotating account: %s", err)
+                    logger.warning("web %s, rotating account: %s", reason, err)
                     _cancel_unclaimed_account_slot(options)
                     next_snapshot = _next_retry_account_snapshot(
                         attempted_accounts, attempts
@@ -10206,7 +10339,6 @@ async def _run_web_with_retry(
                         _cancel_unclaimed_account_slot(options)
                         raise
                     continue
-                raise
             finally:
                 _cancel_unclaimed_account_slot(attempt_options)
         raise RuntimeError("All web accounts busy: Trae parallel limit reached")
@@ -10243,6 +10375,10 @@ async def _run_remote_stream_with_retry(
         return _retry_account_key(current_options, attempt_index)
 
     def _runtime_retry_reason(error: BaseException) -> Optional[str]:
+        if _is_retryable_proxy_transport_error(
+            error, str(current_options.get("_account_id") or "")
+        ):
+            return "proxy transport failure"
         lowered = str(error).lower()
         if (
             "remote model is not available for the bound account" in lowered
@@ -10345,6 +10481,17 @@ async def _run_remote_stream_with_retry(
                 or reason is None
                 or initial_attempt_index + 1 >= max(1, attempts)
                 or not await rotate_account(reason, initial_attempt_index)
+            ):
+                raise
+        except Exception as exc:
+            if (
+                not _is_retryable_proxy_transport_error(
+                    exc, str(current_options.get("_account_id") or "")
+                )
+                or initial_attempt_index + 1 >= max(1, attempts)
+                or not await rotate_account(
+                    "proxy transport failure", initial_attempt_index
+                )
             ):
                 raise
         finally:
@@ -10450,6 +10597,20 @@ async def _run_remote_stream_with_retry(
                 if not await rotate_account(
                     reason,
                     attempt_index,
+                ):
+                    raise
+                attempt_index += 1
+                continue
+            except Exception as exc:
+                if (
+                    observed_model_event
+                    or attempt_index + 1 >= max(1, attempts)
+                    or not _is_retryable_proxy_transport_error(
+                        exc, str(current_options.get("_account_id") or "")
+                    )
+                    or not await rotate_account(
+                        "proxy transport failure", attempt_index
+                    )
                 ):
                     raise
                 attempt_index += 1
@@ -10573,7 +10734,11 @@ async def _run_remote_with_retry(
                     "remote model is not available for the bound account" in lowered
                     or "model binding mismatch" in lowered
                 )
-                if unavailable:
+                if _is_retryable_proxy_transport_error(
+                    exc, str((attempt_options or {}).get("_account_id") or "")
+                ):
+                    reason = "proxy transport failure"
+                elif unavailable:
                     # Model entitlements differ per account. A bound account
                     # missing the requested model is not a request failure;
                     # rotate to the next polling account that can serve it.
@@ -10590,6 +10755,16 @@ async def _run_remote_with_retry(
                     if unavailable:
                         raise
                     break
+                continue
+            except Exception as exc:
+                if (
+                    attempt_index + 1 >= attempts
+                    or not _is_retryable_proxy_transport_error(
+                        exc, str((attempt_options or {}).get("_account_id") or "")
+                    )
+                    or not await rotate_remote_account("proxy transport failure")
+                ):
+                    raise
                 continue
             finally:
                 _cancel_unclaimed_account_slot(attempt_options)
@@ -10753,6 +10928,10 @@ async def _run_ide_stream_with_retry(
             return False
         if _is_native_rate_limit_error(exc):
             return True
+        if _is_retryable_proxy_transport_error(
+            exc, str(options.get("_account_id") or "")
+        ):
+            return True
         return (
             isinstance(exc, EmptyUpstreamResponse)
             and bool(exc.retryable)
@@ -10864,7 +11043,12 @@ async def _run_ide_with_retry(
             return await run_ide_chat(messages, model, stream, attempt_options)
         except Exception as exc:
             if (
-                not _is_native_rate_limit_error(exc)
+                not (
+                    _is_native_rate_limit_error(exc)
+                    or _is_retryable_proxy_transport_error(
+                        exc, str((attempt_options or {}).get("_account_id") or "")
+                    )
+                )
                 or attempt_index + 1 >= attempts
             ):
                 raise
@@ -10899,10 +11083,7 @@ async def _run_ide_with_retry(
             except BaseException:
                 _cancel_unclaimed_account_slot(options)
                 raise
-            logger.warning(
-                "native IDE/SOLO rate limit, retrying on account=%s",
-                account_id,
-            )
+            logger.warning("native IDE/SOLO retrying on account=%s", account_id)
         finally:
             _cancel_unclaimed_account_slot(attempt_options)
     raise RuntimeError("native IDE/SOLO rate-limit retry ended unexpectedly")
@@ -12144,6 +12325,7 @@ async def _load_multimodal_catalog(
     try:
         configs = await trae_client.get_scoped_model_configs(
             token_override=token,
+            account_id=str(options.get("_account_id") or ""),
             user_id_override=user_id,
             provider_specific=(dict(provider) if isinstance(provider, Mapping) else None),
             agent_type=agent_type,
@@ -13717,7 +13899,17 @@ def _checkin_window_minutes() -> tuple[int, int]:
         logger.warning("checkin schedule: invalid window time %r, using default", text)
         return fallback
 
-    return _parse(CHECKIN_WINDOW_START, 6 * 60), _parse(CHECKIN_WINDOW_END, 21 * 60)
+    start = _parse(CHECKIN_WINDOW_START, 6 * 60)
+    end = _parse(CHECKIN_WINDOW_END, 21 * 60)
+    if end <= start:
+        logger.warning(
+            "checkin schedule: invalid window %s-%s (end must be after start); "
+            "using default 06:00-21:00",
+            CHECKIN_WINDOW_START,
+            CHECKIN_WINDOW_END,
+        )
+        return 6 * 60, 21 * 60
+    return start, end
 
 
 def _build_checkin_plan(account_ids: list[str], now: Optional[datetime] = None) -> dict:
@@ -13748,10 +13940,14 @@ def _build_checkin_plan(account_ids: list[str], now: Optional[datetime] = None) 
         total_weight = sum(weights) or 1.0
         base = current.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         base += start_min * 60
-        offsets = [0.0]
-        for idx in range(count):
-            offsets.append(offsets[-1] + weights[idx] / total_weight * slack)
-            if idx < count - 1:
+        if count == 1:
+            # A one-account plan has no gap constraint.  Keep it genuinely
+            # randomized rather than pinning it to the window start.
+            offsets = [weights[0] / total_weight * window_seconds]
+        else:
+            offsets = [0.0]
+            for idx in range(count - 1):
+                offsets.append(offsets[-1] + weights[idx] / total_weight * slack)
                 offsets[-1] += effective_gap
         ordered_ids = list(account_ids)
         secrets.SystemRandom().shuffle(ordered_ids)
@@ -13805,19 +14001,51 @@ def _save_checkin_plan(plan: dict) -> None:
         logger.warning("checkin schedule: could not save %s: %s", path, exc)
 
 
+def _empty_checkin_plan(current: datetime) -> dict:
+    """Describe a disabled scheduler without creating persistent state."""
+
+    return {
+        "date": current.date().isoformat(),
+        "window_start": CHECKIN_WINDOW_START,
+        "window_end": CHECKIN_WINDOW_END,
+        "min_gap_seconds": CHECKIN_MIN_GAP_SECONDS,
+        "effective_gap_seconds": CHECKIN_MIN_GAP_SECONDS,
+        "entries": [],
+    }
+
+
+def _scheduled_checkin_account_ids() -> list[str]:
+    """Return accounts eligible for the opt-in randomized schedule.
+
+    A status response can explicitly say that daily check-in is unavailable
+    for one account.  Missing legacy status remains eligible once the global
+    feature is enabled, but an explicit ``enable: false`` is always honored.
+    """
+
+    account_ids: list[str] = []
+    for account_id, record in auth.get_accounts_raw():
+        checkin = record.get("checkin") or {}
+        if isinstance(checkin, Mapping) and checkin.get("enable") is False:
+            continue
+        account_ids.append(account_id)
+    return account_ids
+
+
 def _checkin_today_plan(now: Optional[datetime] = None) -> dict:
     """Return today's plan, regenerating only when missing or stale."""
     global _CHECKIN_PLAN_CACHE
     current = now or datetime.now(_CHECKIN_TIMEZONE)
+    if not CHECKIN_SCHEDULE_ENABLED:
+        # The feature is deliberately opt-in.  Do not even create a plan file
+        # when a stock deployment merely reads the new diagnostic endpoint.
+        return _empty_checkin_plan(current)
     today = current.date().isoformat()
     with _CHECKIN_PLAN_LOCK:
         plan = _CHECKIN_PLAN_CACHE
         if not plan or plan.get("date") != today:
             plan = _load_checkin_plan()
         if not plan or plan.get("date") != today:
-            plan = _build_checkin_plan(
-                [aid for aid, _ in auth.get_accounts_raw()], current
-            )
+            plan = _build_checkin_plan(_scheduled_checkin_account_ids(), current)
             _save_checkin_plan(plan)
             logger.info(
                 "checkin schedule: generated %d entries for %s (%s-%s, gap %.0fs)",
@@ -13827,20 +14055,36 @@ def _checkin_today_plan(now: Optional[datetime] = None) -> dict:
                 plan["window_end"],
                 plan["effective_gap_seconds"],
             )
-        # Accounts added after plan creation join today's schedule once.
+        # Freeze today's persisted schedule.  Accounts first seen after it
+        # was generated are intentionally deferred to tomorrow, which avoids
+        # moving existing timestamps or clearing completed-entry state.
         known = {str(item.get("account_id")) for item in plan["entries"]}
-        missing = [aid for aid, _ in auth.get_accounts_raw() if aid not in known]
+        deferred = {
+            str(account_id)
+            for account_id in plan.get("deferred_account_ids", [])
+            if str(account_id)
+        }
+        missing = [
+            account_id
+            for account_id in _scheduled_checkin_account_ids()
+            if account_id not in known and account_id not in deferred
+        ]
         if missing:
-            plan = _build_checkin_plan(
-                [aid for aid, _ in auth.get_accounts_raw()], current
-            )
+            plan["deferred_account_ids"] = sorted(deferred.union(missing))
             _save_checkin_plan(plan)
+            logger.info(
+                "checkin schedule: deferred %d account(s) added after today's plan "
+                "until tomorrow",
+                len(missing),
+            )
         _CHECKIN_PLAN_CACHE = plan
         return plan
 
 
 async def _checkin_schedule_cycle() -> None:
     """One scheduler pass: claim every due, unfinished entry of today's plan."""
+    if not CHECKIN_SCHEDULE_ENABLED:
+        return
     plan = _checkin_today_plan()
     now_ts = time.time()
     dirty = False
@@ -13858,7 +14102,17 @@ async def _checkin_schedule_cycle() -> None:
         # another claim.
         try:
             record = auth.get_account_record(account_id)
-            if (record.get("checkin") or {}).get("checked_in") is True and (
+            checkin = record.get("checkin") or {}
+            checkin = checkin if isinstance(checkin, Mapping) else {}
+            if checkin.get("enable") is False:
+                # The account's persisted check-in state can change after a
+                # plan is generated.  Do not send a scheduled claim once it
+                # explicitly opts out/is reported unavailable.
+                entry["done"] = True
+                entry["result"] = "disabled"
+                dirty = True
+                continue
+            if checkin.get("checked_in") is True and (
                 _checkin_cache_is_today(record)
             ):
                 entry["done"] = True
@@ -13866,8 +14120,9 @@ async def _checkin_schedule_cycle() -> None:
                 dirty = True
                 continue
             result = await _claim_checkin_account(account_id)
-            entry["done"] = True
             entry["result"] = "ok" if result.get("success") else "failed"
+            if result.get("success"):
+                entry["done"] = True
             dirty = True
             logger.info(
                 "checkin schedule: account=%s planned=%s result=%s",
@@ -13876,7 +14131,6 @@ async def _checkin_schedule_cycle() -> None:
                 entry["result"],
             )
         except Exception as exc:
-            entry["done"] = True
             entry["result"] = f"error: {exc}"[:200]
             dirty = True
             logger.warning(
@@ -13889,6 +14143,8 @@ async def _checkin_schedule_cycle() -> None:
 
 async def _checkin_schedule_loop():
     """Fire today's planned claims; finished entries are marked done on disk."""
+    if not CHECKIN_SCHEDULE_ENABLED:
+        return
     while True:
         await asyncio.sleep(CHECKIN_SCHEDULE_POLL_SECONDS)
         try:
@@ -13925,6 +14181,7 @@ def _checkin_schedule_payload() -> dict:
     }
     return {
         "success": True,
+        "enabled": CHECKIN_SCHEDULE_ENABLED,
         "date": plan.get("date"),
         "window_start": plan.get("window_start"),
         "window_end": plan.get("window_end"),
@@ -13950,32 +14207,29 @@ async def lifespan(app: FastAPI):
     terminal_reaper = asyncio.create_task(_terminal_session_reaper_loop())
     checkin_retry = asyncio.create_task(_checkin_auto_retry_loop())
     auto_checkin = asyncio.create_task(_auto_checkin_loop())
-    checkin_schedule = asyncio.create_task(_checkin_schedule_loop())
+    checkin_schedule = (
+        asyncio.create_task(_checkin_schedule_loop())
+        if CHECKIN_SCHEDULE_ENABLED
+        else None
+    )
     usage_enrichment = asyncio.create_task(_usage_enrichment_loop())
     credit_reconcile = asyncio.create_task(_credit_reconcile_loop())
     try:
         yield
     finally:
-        for reaper in (
+        tasks = (
             web_reaper,
             terminal_reaper,
             checkin_retry,
             auto_checkin,
-            checkin_schedule,
             usage_enrichment,
             credit_reconcile,
-        ):
-            reaper.cancel()
-        await asyncio.gather(
-            web_reaper,
-            terminal_reaper,
-            checkin_retry,
-            auto_checkin,
-            checkin_schedule,
-            usage_enrichment,
-            credit_reconcile,
-            return_exceptions=True,
         )
+        if checkin_schedule is not None:
+            tasks = (*tasks, checkin_schedule)
+        for reaper in tasks:
+            reaper.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await _cancel_usage_tasks()
 
 
@@ -14105,6 +14359,29 @@ async def api_usage_last():
 async def auth_middleware(request: Request, call_next):
     if not API_KEYS:
         return await call_next(request)
+
+    def supplied_api_key() -> str:
+        header = request.headers.get("authorization", "")
+        if header.lower().startswith("bearer "):
+            token = header[7:].strip()
+        else:
+            token = header.strip()
+        if not token:
+            # Anthropic clients (Claude Code) authenticate with ``x-api-key``
+            # instead of a bearer Authorization header.
+            token = request.headers.get("x-api-key", "").strip()
+        return token
+
+    def reject_invalid_api_key():
+        return _openai_error(401, "Invalid API key", "authentication_error")
+
+    # This account mutation must not inherit the broad historical
+    # ``/api/accounts`` public-prefix exemption below.  It uses exactly the
+    # relay API-key parsing accepted by normal protected endpoints.
+    if request.url.path == "/api/accounts/proxy":
+        if supplied_api_key() not in API_KEYS:
+            return reject_invalid_api_key()
+        return await call_next(request)
     if request.url.path == "/api/model-test":
         # Keep the dashboard probe usable on loopback/RFC1918 management
         # networks without exposing a billable model endpoint to the public.
@@ -14121,17 +14398,8 @@ async def auth_middleware(request: Request, call_next):
             return await call_next(request)
     if request.url.path in PUBLIC_PATHS or request.url.path.startswith(PUBLIC_PATH_PREFIXES):
         return await call_next(request)
-    header = request.headers.get("authorization", "")
-    if header.lower().startswith("bearer "):
-        token = header[7:].strip()
-    else:
-        token = header.strip()
-    if not token:
-        # Anthropic clients (Claude Code) authenticate with ``x-api-key``
-        # instead of a bearer Authorization header.
-        token = request.headers.get("x-api-key", "").strip()
-    if token not in API_KEYS:
-        return _openai_error(401, "Invalid API key", "authentication_error")
+    if supplied_api_key() not in API_KEYS:
+        return reject_invalid_api_key()
     return await call_next(request)
 
 
@@ -14870,13 +15138,13 @@ def _credits_user_name(raw: dict) -> str:
     return ""
 
 
-async def _fetch_full_credits(token: str) -> dict:
+async def _fetch_full_credits(token: str, *, account_id: str = "") -> dict:
     """Fetch the merged general (通用) credits for one token.
 
     Upstream merged every pack into a single 通用积分 pool, so the relay only
     queries req_source=1 and no longer derives work/total splits.
     """
-    raw_ac = await trae_client.fetch_account_credits(token)
+    raw_ac = await trae_client.fetch_account_credits(token, account_id=account_id)
     return {
         "account_credits": trae_client.parse_account_credits(raw_ac),
         "user_name": _credits_user_name(raw_ac),
@@ -14992,11 +15260,13 @@ async def _fetch_credit_account_snapshot(
         raise KeyError("account not found or token missing")
 
     try:
-        full = await _fetch_full_credits(token)
+        full = await _fetch_full_credits(token, account_id=account_id)
     except Exception as exc:
         if _credits_auth_failed(exc) and await auth.refresh_account(account_id):
             fresh = auth.get_account_record(account_id)
-            full = await _fetch_full_credits(fresh.get("token") or "")
+            full = await _fetch_full_credits(
+                fresh.get("token") or "", account_id=account_id
+            )
         else:
             raise
     patch = {key: value for key, value in full.items() if value is not None}
@@ -15055,11 +15325,13 @@ async def _sync_account_user_name(account_id: str) -> dict:
     if not token:
         raise KeyError("account not found or token missing")
     try:
-        info = await trae_client.fetch_user_info(token)
+        info = await trae_client.fetch_user_info(token, account_id=account_id)
     except Exception as exc:
         if _credits_auth_failed(exc) and await auth.refresh_account(account_id):
             fresh = auth.get_account_record(account_id)
-            info = await trae_client.fetch_user_info(fresh.get("token") or "")
+            info = await trae_client.fetch_user_info(
+                fresh.get("token") or "", account_id=account_id
+            )
         else:
             raise
     name = str(info.get("ScreenName") or "").strip()
@@ -16208,6 +16480,7 @@ async def api_max_mode_models():
         token_override=token,
         provider_specific=dict(provider) if isinstance(provider, Mapping) else None,
         agent_type="solo_agent_remote",
+        account_id=account_id,
     )
     models = [
         {

@@ -21,7 +21,9 @@ def _lookup_timeout() -> float:
         return 3.0
 
 
-async def enrich_usage(usage, token: str, turn_id: str, *, match_completion=False):
+async def enrich_usage(
+    usage, token: str, turn_id: str, *, match_completion=False, account_id: str = ""
+):
     """Supplement cache details only when the isolated turn bill matches."""
     details = usage_details(usage or {})
     timeout = _lookup_timeout()
@@ -38,7 +40,7 @@ async def enrich_usage(usage, token: str, turn_id: str, *, match_completion=Fals
             await asyncio.sleep(delay)
         try:
             bill = await asyncio.wait_for(
-                trae_client.fetch_session_usage(turn_id, token),
+                trae_client.fetch_session_usage(turn_id, token, account_id=account_id),
                 timeout=deadline - asyncio.get_running_loop().time(),
             )
         except asyncio.CancelledError:
@@ -72,16 +74,21 @@ def legacy_usage_enricher(response_wrapper, upstream_metadata):
     """Capture only an adapter-verified per-request billing identity."""
     turn_id = getattr(response_wrapper, "usage_turn_id", "")
     token = getattr(response_wrapper, "auth_token", "")
+    account_id = getattr(response_wrapper, "account_id", "")
     if not isinstance(turn_id, str) or not turn_id or not isinstance(token, str) or not token:
         return None
     async def enrich(usage):
         upstream_metadata["usage_turn_id"] = turn_id
-        return await enrich_usage(usage, token, turn_id, match_completion=True)
+        return await enrich_usage(
+            usage, token, turn_id, match_completion=True, account_id=account_id
+        )
 
     return enrich
 
 
-async def enrich_remote_events(events, token: str, turn_id: str):
+async def enrich_remote_events(
+    events, token: str, turn_id: str, *, account_id: str = ""
+):
     """Emit verified cache counters before the public terminal usage frame.
 
     Since October 27, Remote can report zero cache counters while its bill
@@ -116,7 +123,9 @@ async def enrich_remote_events(events, token: str, turn_id: str):
             if name == 'done':
                 # Consumers stop at done without advancing this generator.
                 await close_source()
-                recovered = await enrich_usage(usage, token, turn_id)
+                recovered = await enrich_usage(
+                    usage, token, turn_id, account_id=account_id
+                )
                 if recovered is not usage:
                     yield 'token_usage', recovered
                 yield event, data

@@ -500,6 +500,7 @@ class RemoteClientTests(unittest.TestCase):
             token_override="jwt-token",
             user_id_override="1329782626198720",
             provider_specific={},
+            account_id="1329782626198720",
         )
         initial = request["json"]["initial_message"]
         self.assertEqual(initial["model_selection_strategy"], "manual")

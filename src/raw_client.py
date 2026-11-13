@@ -85,6 +85,18 @@ _TRAECODE_PROTECTED_HEADERS = {
 }
 
 
+def _proxy_client_kwargs(account_id: str, direct_timeout: float) -> dict[str, Any]:
+    """Keep direct raw-stream timing intact while bounding dead proxies."""
+
+    proxy_kwargs = auth.proxy_httpx_kwargs(account_id)
+    if not proxy_kwargs:
+        return {"timeout": direct_timeout}
+    return {
+        "timeout": httpx.Timeout(60.0, connect=10.0, pool=10.0),
+        **proxy_kwargs,
+    }
+
+
 @dataclass
 class _RawSessionGate:
     slots: threading.BoundedSemaphore
@@ -212,6 +224,10 @@ class TraeCodeRateLimitError(RuntimeError):
         )
 
 
+class TraeCodeTransportError(RuntimeError):
+    """A native request could not reach its account-bound transport."""
+
+
 @dataclass
 class RawChatResponse:
     """Streaming response plus the client that owns its connection."""
@@ -219,6 +235,7 @@ class RawChatResponse:
     response: httpx.Response
     client: httpx.Client
     auth_token: str = ""
+    account_id: str = ""
     release_session: Optional[Callable[[], None]] = field(default=None, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
     _close_lock: threading.Lock = field(
@@ -691,6 +708,7 @@ async def resolve_traecode_model_for_request(
             live = await trae_client.resolve_traecode_model_config(
                 model,
                 token_override=token,
+                account_id=str(options.get("_account_id") or ""),
                 user_id_override=bound_user_id,
                 provider_specific=(
                     dict(provider_specific)
@@ -1504,11 +1522,13 @@ async def send_traecode_chat_request(
         client: Optional[httpx.Client] = None
         response: Optional[httpx.Response] = None
         detail = ""
+        transport_error: Optional[httpx.RequestError] = None
         try:
             client = httpx.Client(
-                timeout=timeout,
                 http2=False,
-                **auth.proxy_httpx_kwargs(str(options.get("_account_id") or "")),
+                **_proxy_client_kwargs(
+                    str(options.get("_account_id") or ""), timeout
+                ),
             )
             for base_url in base_urls:
                 request_headers = headers
@@ -1534,6 +1554,7 @@ async def send_traecode_chat_request(
                         )
                         response = client.send(request, stream=True)
                     except httpx.RequestError as exc:
+                        transport_error = exc
                         detail = str(exc)[:800]
                         logger.warning(
                             "traecode raw transport failed id=%s base=%s endpoint=%s error=%s",
@@ -1548,6 +1569,7 @@ async def send_traecode_chat_request(
                             response=response,
                             client=client,
                             auth_token=token,
+                            account_id=str(options.get("_account_id") or ""),
                             release_session=release_session,
                         )
                     status_code = response.status_code
@@ -1598,6 +1620,10 @@ async def send_traecode_chat_request(
                         raise TraeCodeRateLimitError(
                             status_code, rate_limit_code, detail
                         )
+            if transport_error is not None:
+                raise TraeCodeTransportError(
+                    "TraeCode raw proxy transport failed before a response"
+                ) from transport_error
             raise RuntimeError(
                 "TraeCode raw chat request failed on "
                 + ", ".join(
@@ -1846,6 +1872,9 @@ async def resolve_raw_model_for_request(
         ).strip()
         if bound_user_id:
             lookup_kwargs["user_id_override"] = bound_user_id
+        account_id = str(options.get("_account_id") or "").strip()
+        if account_id:
+            lookup_kwargs["account_id"] = account_id
         provider_specific = options.get("provider_specific")
         if provider_specific is None and "providerSpecificData" in options:
             provider_specific = options.get("providerSpecificData")
@@ -3300,9 +3329,10 @@ async def send_raw_chat_request(
         response: Optional[httpx.Response] = None
         try:
             client = httpx.Client(
-                timeout=timeout,
                 http2=False,
-                **auth.proxy_httpx_kwargs(str(options.get("_account_id") or "")),
+                **_proxy_client_kwargs(
+                    str(options.get("_account_id") or ""), timeout
+                ),
             )
             request = client.build_request(
                 "POST",
@@ -3323,6 +3353,7 @@ async def send_raw_chat_request(
                 response=response,
                 client=client,
                 auth_token=token,
+                account_id=str(options.get("_account_id") or ""),
                 release_session=release_session,
             )
         except BaseException:
