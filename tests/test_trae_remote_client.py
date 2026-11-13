@@ -766,7 +766,7 @@ class RemoteClientTests(unittest.TestCase):
             )
 
         self.assertEqual(headers["x-preferenced-language"], "zh-cn")
-        self.assertEqual(headers["x-user-region"], "CN")
+        self.assertNotIn("x-user-region", headers)
 
     def test_build_headers_mirrors_real_browser_client_hints(self):
         """Header hygiene (1.3.0.2): the web client captured in a browser
@@ -2552,7 +2552,7 @@ class RemoteClientTests(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=False):
             self.assertIn("trae-api-cn", trae_remote_client.base_url())
             headers = trae_remote_client.build_headers("jwt")
-        self.assertEqual(headers["x-user-region"], "CN")
+        self.assertNotIn("x-user-region", headers)
         self.assertIn("work.trae.cn", headers["referer"])
 
     def test_bare_trae_host_is_repaired_with_remote_path(self):

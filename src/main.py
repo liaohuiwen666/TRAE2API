@@ -1318,7 +1318,7 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
-APP_VERSION = "1.3.0.3"
+APP_VERSION = "1.3.0.4"
 
 # Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
 _LUCIDE_ICONS = {
@@ -2348,9 +2348,12 @@ def _web_login_html() -> str:
     poll_pill = ' on' if polling.get('enabled') else ''
     auto_route_pill = ' on' if auto_route_on else ''
     max_pill = ' on' if max_settings.get('enabled') else ''
-    auto_checkin_pill = ' on' if auto_checkin.get('enabled') else ''
+    random_schedule_on = _effective_checkin_schedule_settings().get("enabled")
+    auto_checkin_pill = ' on' if auto_checkin.get('enabled') and not random_schedule_on else ''
     auto_checkin_state_text = (
-        f"每天 {auto_checkin_time} 自动签到" if auto_checkin.get('enabled') else '已关闭'
+        "随机签到已接管"
+        if auto_checkin.get('enabled') and random_schedule_on
+        else f"每天 {auto_checkin_time} 自动签到" if auto_checkin.get('enabled') else '已关闭'
     )
 
     return f"""<!doctype html>
@@ -14303,6 +14306,12 @@ def _auto_checkin_target(now: Optional[datetime] = None, time_text: str = "08:30
 def _auto_checkin_next_run(settings: dict, now: Optional[datetime] = None) -> Optional[datetime]:
     if not settings.get("enabled"):
         return None
+    # The randomized schedule supersedes the fixed daily time: when it is
+    # enabled, the fixed pass would only re-visit accounts the window pass
+    # already handled (both skip already-checked-in accounts), so there is
+    # no next fixed run to report.
+    if _effective_checkin_schedule_settings().get("enabled"):
+        return None
     current = now or datetime.now(_CHECKIN_TIMEZONE)
     target = _auto_checkin_target(current, settings.get("time") or "08:30")
     if _AUTO_CHECKIN_STATE.get("last_run_date") == current.date().isoformat():
@@ -14313,6 +14322,13 @@ def _auto_checkin_next_run(settings: dict, now: Optional[datetime] = None) -> Op
 
 def _auto_checkin_due(settings: dict, now: Optional[datetime] = None) -> bool:
     if not settings.get("enabled"):
+        return False
+    # The randomized schedule supersedes the fixed daily time. When it is
+    # enabled, the fixed 08:30 pass stands down: both paths claim through
+    # the same _claim_checkin_account and skip accounts already checked in
+    # today, so the fixed pass would only re-visit what the window pass
+    # already handled.
+    if _effective_checkin_schedule_settings().get("enabled"):
         return False
     current = now or datetime.now(_CHECKIN_TIMEZONE)
     if _AUTO_CHECKIN_STATE.get("last_run_date") == current.date().isoformat():

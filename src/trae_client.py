@@ -1449,9 +1449,6 @@ def build_web_headers(
         "x-preferenced-language": language,
         "x-trae-client-type": "web",
         "x-trae-user-timezone": "Asia/Shanghai",
-        "x-user-region": psd.get("userRegion")
-        or os.environ.get("TRAE_WEB_USER_REGION")
-        or "CN",
     }
     if not stream:
         headers["content-type"] = "application/json"

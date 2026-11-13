@@ -92,6 +92,24 @@ class AutoCheckinScheduleTests(unittest.TestCase):
                 datetime(2026, 10, 2, 8, 30, tzinfo=TZ),
             )
 
+    def test_fixed_stands_down_when_random_schedule_enabled(self):
+        # 1.3.0.4: the randomized schedule supersedes the fixed daily time.
+        # Both paths claim through the same _claim_checkin_account and skip
+        # accounts already checked in today, so the fixed pass would only
+        # re-visit what the window pass already handled.
+        settings = {"enabled": True, "time": "08:30"}
+        after = datetime(2026, 10, 1, 9, 0, tzinfo=TZ)
+        with (
+            patch.object(main_module, "_AUTO_CHECKIN_STATE", _fresh_state()),
+            patch.object(
+                main_module,
+                "_effective_checkin_schedule_settings",
+                return_value={"enabled": True},
+            ),
+        ):
+            self.assertFalse(main_module._auto_checkin_due(settings, after))
+            self.assertIsNone(main_module._auto_checkin_next_run(settings, after))
+
 
 class AutoCheckinCycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_cycle_skips_checked_in_and_tokenless_accounts(self):

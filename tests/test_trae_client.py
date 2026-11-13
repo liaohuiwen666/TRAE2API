@@ -773,7 +773,7 @@ class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(common["web_id"], "bound-web")
         self.assertEqual(common["biz_user_id"], "bound-biz")
         self.assertEqual(fake_client.request["headers"]["x-preferenced-language"], "ja-JP")
-        self.assertEqual(fake_client.request["headers"]["x-user-region"], "JP")
+        self.assertNotIn("x-user-region", fake_client.request["headers"])
 
     def test_web_headers_preserve_bound_empty_provider_metadata(self):
         with patch.object(
@@ -786,7 +786,7 @@ class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(headers["x-preferenced-language"], "zh-cn")
-        self.assertEqual(headers["x-user-region"], "CN")
+        self.assertNotIn("x-user-region", headers)
 
 
 class SessionUsageTests(unittest.IsolatedAsyncioTestCase):

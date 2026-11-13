@@ -357,7 +357,6 @@ def build_headers(
     base = base_url(options).lower()
     intl = "trae.ai" in base and "trae-api-cn" not in base
     language_default = "en" if intl else "zh-CN"
-    region_default = "US" if intl else "CN"
     origin_default = "https://solo.trae.ai" if intl else DEFAULT_ORIGIN
     origin = os.environ.get("TRAE_WEB_ORIGIN") or origin_default
     language = str(
@@ -375,8 +374,6 @@ def build_headers(
         # is "cross-site" (the captured same-origin value came from a
         # work.trae.cn -> work.trae.cn request). No Content-Type on the
         # streaming GET: a real browser sends none without a body.
-        # x-user-region is kept even though the captured client does not
-        # send it: the gateway may route on it.
         "accept": "text/event-stream" if stream else "application/json",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
         "authorization": f"Cloud-IDE-JWT {token}",
@@ -393,9 +390,6 @@ def build_headers(
         "x-preferenced-language": language,
         "x-trae-client-type": os.environ.get("TRAE_WEB_CLIENT_TYPE", "web"),
         "x-trae-user-timezone": "Asia/Shanghai",
-        "x-user-region": str(
-            _psd_value(psd, "userRegion") or os.environ.get("TRAE_WEB_USER_REGION") or region_default
-        ),
     }
     if not stream:
         headers["content-type"] = "application/json"
