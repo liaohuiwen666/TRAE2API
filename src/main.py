@@ -1083,7 +1083,7 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
 _LUCIDE_ICONS = {
@@ -2333,6 +2333,36 @@ def _web_login_html() -> str:
     <div><dt>上次结果</dt><dd id="auto-checkin-result">-</dd></div>
   </dl>
   <div id="auto-checkin-msg" class="msg" role="status" aria-live="polite"></div>
+  <div class="section-head">
+    <div class="section-title">随机签到设置</div>
+    <span id="checkin-schedule-state" class="state-pill">加载中...</span>
+  </div>
+  <div class="switch-row">
+    <div class="switch-text"><strong>启用随机签到</strong><span>每天在设定窗口内为各账号随机安排签到时间</span></div>
+    <label class="switch" title="启用随机签到">
+      <input type="checkbox" id="checkin-schedule-toggle" onchange="markCheckinScheduleDirty()" aria-label="启用随机签到"><span class="track"></span>
+    </label>
+  </div>
+  <div class="schedule-row">
+    <label class="time-field" for="checkin-schedule-window-start">窗口开始（北京时间）
+      <input class="control" type="time" id="checkin-schedule-window-start" step="60" required oninput="markCheckinScheduleDirty()">
+    </label>
+    <label class="time-field" for="checkin-schedule-window-minutes">窗口时长（分钟）
+      <input class="control" type="number" id="checkin-schedule-window-minutes" min="1" step="1" required oninput="markCheckinScheduleDirty()">
+    </label>
+    <label class="time-field" for="checkin-schedule-min-gap-minutes">最小间隔（分钟）
+      <input class="control" type="number" id="checkin-schedule-min-gap-minutes" min="0" step="any" required oninput="markCheckinScheduleDirty()">
+      <span id="checkin-schedule-max-gap" class="section-meta">-</span>
+    </label>
+    <div class="toolbar">
+      <button class="btn btn-primary btn-sm" id="checkin-schedule-save-btn" onclick="saveCheckinScheduleSettings()" disabled>{ic['save']}保存</button>
+    </div>
+  </div>
+  <dl class="schedule-status">
+    <div><dt>派生结束</dt><dd id="checkin-schedule-window-end">-</dd></div>
+    <div><dt>生效间隔</dt><dd id="checkin-schedule-effective-gap">-</dd></div>
+  </dl>
+  <div id="checkin-schedule-msg" class="msg" role="status" aria-live="polite"></div>
   <details class="manual-add" id="checkin-schedule-details">
     <summary>今日随机签到计划<span id="checkin-schedule-meta" class="section-meta"></span></summary>
     <div id="checkin-schedule-body" class="usage-records-container">加载中...</div>
@@ -4526,6 +4556,122 @@ async function runAutoCheckinNow(){{
 }}
 loadAutoCheckin();
 setInterval(loadAutoCheckin,60000);
+let checkinScheduleDirty=false;
+let checkinScheduleSettings=null;
+function checkinScheduleDraft(){{
+  var start=document.getElementById('checkin-schedule-window-start');
+  var duration=document.getElementById('checkin-schedule-window-minutes');
+  var gap=document.getElementById('checkin-schedule-min-gap-minutes');
+  return {{
+    window_start:start?start.value:'',
+    window_minutes:duration?Number(duration.value):NaN,
+    min_gap_minutes:gap?Number(gap.value):NaN
+  }};
+}}
+function updateCheckinScheduleHint(){{
+  var draft=checkinScheduleDraft();
+  var end=document.getElementById('checkin-schedule-window-end');
+  var maxHint=document.getElementById('checkin-schedule-max-gap');
+  var effective=document.getElementById('checkin-schedule-effective-gap');
+  var match=String(draft.window_start||'').match(/^(\\d{{2}}):(\\d{{2}})$/);
+  var startMinutes=match ? Number(match[1])*60+Number(match[2]) : NaN;
+  var windowValid=Number.isInteger(draft.window_minutes)&&draft.window_minutes>0
+    &&Number.isFinite(startMinutes)&&startMinutes+draft.window_minutes<=1440;
+  if(end){{
+    if(!windowValid) end.textContent='请填写不超过 24:00 的开始时间和时长';
+    else{{
+      var endMinutes=startMinutes+draft.window_minutes;
+      end.textContent=String(Math.floor(endMinutes/60)).padStart(2,'0')+':'+String(endMinutes%60).padStart(2,'0');
+    }}
+  }}
+  var accountCount=document.querySelectorAll('tr[data-account-id]').length;
+  var matchesSaved=checkinScheduleSettings
+    &&draft.window_start===checkinScheduleSettings.window_start
+    &&draft.window_minutes===Number(checkinScheduleSettings.window_minutes);
+  var maxMinutes=null;
+  if(matchesSaved) maxMinutes=checkinScheduleSettings.max_gap_minutes;
+  else if(windowValid&&accountCount>=2) maxMinutes=Math.floor(draft.window_minutes/(accountCount-1));
+  if(maxHint){{
+    if(maxMinutes===null||maxMinutes===undefined){{
+      maxHint.textContent='当前不足 2 个号，无间隔上限';
+    }}else{{
+      maxHint.textContent='当前 '+accountCount+' 个号、窗口 '+draft.window_minutes+' 分钟，间隔最多 '+maxMinutes+' 分钟';
+    }}
+  }}
+  if(effective){{
+    if(!Number.isFinite(draft.min_gap_minutes)||draft.min_gap_minutes<0) effective.textContent='-';
+    else{{
+      var effectiveGap=maxMinutes===null||maxMinutes===undefined
+        ? draft.min_gap_minutes : Math.min(draft.min_gap_minutes,maxMinutes);
+      effective.textContent=String(effectiveGap)+' 分钟';
+    }}
+  }}
+}}
+function markCheckinScheduleDirty(){{
+  checkinScheduleDirty=true;
+  var button=document.getElementById('checkin-schedule-save-btn');
+  if(button) button.disabled=false;
+  updateCheckinScheduleHint();
+  showMsg('checkin-schedule-msg','随机签到设置已修改，点击“保存”后生效',true,0);
+}}
+function renderCheckinScheduleSettings(d){{
+  if(!d||!d.success) return;
+  checkinScheduleSettings=d;
+  var toggle=document.getElementById('checkin-schedule-toggle');
+  var start=document.getElementById('checkin-schedule-window-start');
+  var duration=document.getElementById('checkin-schedule-window-minutes');
+  var gap=document.getElementById('checkin-schedule-min-gap-minutes');
+  if(!checkinScheduleDirty){{
+    if(toggle) toggle.checked=!!d.enabled;
+    if(start&&d.window_start) start.value=d.window_start;
+    if(duration&&d.window_minutes!==undefined) duration.value=String(d.window_minutes);
+    if(gap&&d.min_gap_minutes!==undefined) gap.value=String(d.min_gap_minutes);
+  }}
+  setStatePill('checkin-schedule-state',d.enabled?'已开启':'已关闭',!!d.enabled);
+  updateCheckinScheduleHint();
+}}
+async function loadCheckinScheduleSettings(){{
+  try{{
+    var result=await requestJSON('/api/checkin/schedule/settings',{{method:'GET'}},15000);
+    if(result.ok) renderCheckinScheduleSettings(result.data);
+    return result.data;
+  }}catch(e){{ return null; }}
+}}
+async function saveCheckinScheduleSettingsRequest(payload){{
+  var headers=proxyManagementApiKey
+    ? {{'Authorization':'Bearer '+proxyManagementApiKey}}
+    : undefined;
+  var response=await postJSON('/api/checkin/schedule/settings',payload,30000,headers);
+  if(response._http_status!==401) return response;
+  var entered=window.prompt('请输入 RELAY_API_KEYS 中的 API 密钥以保存随机签到设置');
+  if(!entered) return response;
+  proxyManagementApiKey=entered.trim();
+  if(!proxyManagementApiKey) return response;
+  return await postJSON(
+    '/api/checkin/schedule/settings', payload, 30000,
+    {{'Authorization':'Bearer '+proxyManagementApiKey}}
+  );
+}}
+async function saveCheckinScheduleSettings(){{
+  var toggle=document.getElementById('checkin-schedule-toggle');
+  var draft=checkinScheduleDraft();
+  var d=await saveCheckinScheduleSettingsRequest({{
+    enabled:!!(toggle&&toggle.checked),
+    window_start:draft.window_start,
+    window_minutes:draft.window_minutes,
+    min_gap_minutes:draft.min_gap_minutes
+  }});
+  if(d.success){{
+    checkinScheduleDirty=false;
+    var button=document.getElementById('checkin-schedule-save-btn');
+    if(button) button.disabled=true;
+    renderCheckinScheduleSettings(d);
+    showMsg('checkin-schedule-msg',d.enabled?'随机签到已保存并开启':'随机签到设置已保存，当前关闭',true,3000);
+    loadCheckinSchedule();
+  }}else showMsg('checkin-schedule-msg',d.error||'保存失败',false);
+}}
+loadCheckinScheduleSettings();
+setInterval(loadCheckinScheduleSettings,60000);
 async function loadCheckinSchedule(){{
   try{{
     var result=await requestJSON('/api/checkin/schedule',{{method:'GET'}},15000);
@@ -13884,32 +14030,92 @@ async def _auto_checkin_loop():
 CHECKIN_SCHEDULE_POLL_SECONDS = 30.0
 _CHECKIN_PLAN_LOCK = threading.Lock()
 _CHECKIN_PLAN_CACHE: dict | None = None
+_CHECKIN_SCHEDULE_TASK: asyncio.Task | None = None
 
 
-def _checkin_window_minutes() -> tuple[int, int]:
-    """Parse the HH:MM window, falling back to 06:00-21:00 on bad input."""
+def _checkin_clock_minutes(text, *, allow_24_end: bool = False) -> int:
+    """Parse a schedule clock time into minutes after midnight."""
 
-    def _parse(text: str, fallback: int) -> int:
-        try:
-            hour, minute = (int(part) for part in str(text).strip().split(":", 1))
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                return hour * 60 + minute
-        except (ValueError, TypeError):
-            pass
-        logger.warning("checkin schedule: invalid window time %r, using default", text)
-        return fallback
+    value = str(text or "").strip()
+    if allow_24_end and value == "24:00":
+        return 24 * 60
+    hour, minute = (int(part) for part in value.split(":", 1))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("invalid clock time")
+    return hour * 60 + minute
 
-    start = _parse(CHECKIN_WINDOW_START, 6 * 60)
-    end = _parse(CHECKIN_WINDOW_END, 21 * 60)
-    if end <= start:
+
+def _checkin_clock_text(minutes: int) -> str:
+    """Format a validated minute offset, including a derived ``24:00`` end."""
+
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _effective_checkin_schedule_settings() -> dict:
+    """Return the stored setting or the import-time environment defaults."""
+
+    settings = auth.get_checkin_schedule_settings()
+    if settings.get("source") != "env":
+        return settings
+    try:
+        start = _checkin_clock_minutes(CHECKIN_WINDOW_START)
+        end = _checkin_clock_minutes(CHECKIN_WINDOW_END, allow_24_end=True)
+        if end <= start:
+            raise ValueError("end must be after start")
+        window_minutes = end - start
+    except (TypeError, ValueError):
         logger.warning(
             "checkin schedule: invalid window %s-%s (end must be after start); "
             "using default 06:00-21:00",
             CHECKIN_WINDOW_START,
             CHECKIN_WINDOW_END,
         )
+        start = 6 * 60
+        window_minutes = 15 * 60
+    return {
+        # Keep the module constant as the runtime fallback for compatibility
+        # with the existing scheduler's import-time env semantics.
+        "enabled": CHECKIN_SCHEDULE_ENABLED,
+        "window_start": _checkin_clock_text(start),
+        "window_minutes": window_minutes,
+        "min_gap_minutes": settings.get("min_gap_minutes"),
+        "source": "env",
+    }
+
+
+def _checkin_window_minutes() -> tuple[int, int]:
+    """Return the effective start and derived end of the check-in window."""
+
+    settings = _effective_checkin_schedule_settings()
+    try:
+        start = _checkin_clock_minutes(settings.get("window_start"))
+        window_minutes = int(settings.get("window_minutes"))
+        if window_minutes <= 0 or start + window_minutes > 24 * 60:
+            raise ValueError("invalid window")
+        return start, start + window_minutes
+    except (TypeError, ValueError):
+        logger.warning("checkin schedule: invalid persisted window; using default 06:00-21:00")
         return 6 * 60, 21 * 60
-    return start, end
+
+
+def _checkin_max_feasible_gap_seconds(
+    account_count: int, window_minutes: int | float
+) -> float | None:
+    """Return the largest pairwise gap that fits, or None for fewer than two."""
+
+    if account_count < 2:
+        return None
+    return max(0.0, float(window_minutes) * 60) / (account_count - 1)
+
+
+def _checkin_effective_gap_seconds(
+    account_count: int, window_minutes: int | float, requested_gap_seconds: float
+) -> tuple[float | None, float]:
+    """Compute the plan-generation safety-net gap in seconds."""
+
+    maximum = _checkin_max_feasible_gap_seconds(account_count, window_minutes)
+    requested = max(0.0, float(requested_gap_seconds))
+    return maximum, min(requested, maximum) if maximum is not None else requested
 
 
 def _build_checkin_plan(account_ids: list[str], now: Optional[datetime] = None) -> dict:
@@ -13918,9 +14124,12 @@ def _build_checkin_plan(account_ids: list[str], now: Optional[datetime] = None) 
     start_min, end_min = _checkin_window_minutes()
     window_seconds = max(0, (end_min - start_min) * 60)
     count = len(account_ids)
-    min_gap = max(0.0, float(CHECKIN_MIN_GAP_SECONDS))
-    if count > 1 and window_seconds and (count - 1) * min_gap > window_seconds:
-        effective_gap = window_seconds / (count - 1)
+    settings = _effective_checkin_schedule_settings()
+    min_gap = max(0.0, float(settings.get("min_gap_minutes") or 0) * 60)
+    maximum_gap, effective_gap = _checkin_effective_gap_seconds(
+        count, (end_min - start_min), min_gap
+    )
+    if maximum_gap is not None and min_gap > maximum_gap:
         logger.warning(
             "checkin schedule: %d accounts x %.0fs min gap do not fit the %ds window; "
             "compressed gap to %.1fs",
@@ -13929,8 +14138,6 @@ def _build_checkin_plan(account_ids: list[str], now: Optional[datetime] = None) 
             window_seconds,
             effective_gap,
         )
-    else:
-        effective_gap = min_gap
     entries: list[dict] = []
     if count:
         slack = max(0.0, window_seconds - (count - 1) * effective_gap)
@@ -13964,8 +14171,8 @@ def _build_checkin_plan(account_ids: list[str], now: Optional[datetime] = None) 
         entries.sort(key=lambda item: item["at"])
     return {
         "date": current.date().isoformat(),
-        "window_start": CHECKIN_WINDOW_START,
-        "window_end": CHECKIN_WINDOW_END,
+        "window_start": _checkin_clock_text(start_min),
+        "window_end": _checkin_clock_text(end_min),
         "min_gap_seconds": min_gap,
         "effective_gap_seconds": effective_gap,
         "entries": entries,
@@ -14004,12 +14211,15 @@ def _save_checkin_plan(plan: dict) -> None:
 def _empty_checkin_plan(current: datetime) -> dict:
     """Describe a disabled scheduler without creating persistent state."""
 
+    start_min, end_min = _checkin_window_minutes()
+    settings = _effective_checkin_schedule_settings()
+    min_gap = max(0.0, float(settings.get("min_gap_minutes") or 0) * 60)
     return {
         "date": current.date().isoformat(),
-        "window_start": CHECKIN_WINDOW_START,
-        "window_end": CHECKIN_WINDOW_END,
-        "min_gap_seconds": CHECKIN_MIN_GAP_SECONDS,
-        "effective_gap_seconds": CHECKIN_MIN_GAP_SECONDS,
+        "window_start": _checkin_clock_text(start_min),
+        "window_end": _checkin_clock_text(end_min),
+        "min_gap_seconds": min_gap,
+        "effective_gap_seconds": min_gap,
         "entries": [],
     }
 
@@ -14035,7 +14245,7 @@ def _checkin_today_plan(now: Optional[datetime] = None) -> dict:
     """Return today's plan, regenerating only when missing or stale."""
     global _CHECKIN_PLAN_CACHE
     current = now or datetime.now(_CHECKIN_TIMEZONE)
-    if not CHECKIN_SCHEDULE_ENABLED:
+    if not _effective_checkin_schedule_settings().get("enabled"):
         # The feature is deliberately opt-in.  Do not even create a plan file
         # when a stock deployment merely reads the new diagnostic endpoint.
         return _empty_checkin_plan(current)
@@ -14083,7 +14293,7 @@ def _checkin_today_plan(now: Optional[datetime] = None) -> dict:
 
 async def _checkin_schedule_cycle() -> None:
     """One scheduler pass: claim every due, unfinished entry of today's plan."""
-    if not CHECKIN_SCHEDULE_ENABLED:
+    if not _effective_checkin_schedule_settings().get("enabled"):
         return
     plan = _checkin_today_plan()
     now_ts = time.time()
@@ -14143,14 +14353,26 @@ async def _checkin_schedule_cycle() -> None:
 
 async def _checkin_schedule_loop():
     """Fire today's planned claims; finished entries are marked done on disk."""
-    if not CHECKIN_SCHEDULE_ENABLED:
-        return
-    while True:
+    while _effective_checkin_schedule_settings().get("enabled"):
         await asyncio.sleep(CHECKIN_SCHEDULE_POLL_SECONDS)
+        if not _effective_checkin_schedule_settings().get("enabled"):
+            break
         try:
             await _checkin_schedule_cycle()
         except Exception as exc:
             logger.warning("checkin schedule loop error: %s", exc)
+
+
+def _ensure_checkin_schedule_loop() -> None:
+    """Start the opt-in worker when the panel enables it after startup."""
+
+    global _CHECKIN_SCHEDULE_TASK
+    loop = asyncio.get_running_loop()
+    if (
+        _effective_checkin_schedule_settings().get("enabled")
+        and (_CHECKIN_SCHEDULE_TASK is None or _CHECKIN_SCHEDULE_TASK.done())
+    ):
+        _CHECKIN_SCHEDULE_TASK = loop.create_task(_checkin_schedule_loop())
 
 
 def _auto_checkin_payload() -> dict:
@@ -14181,7 +14403,7 @@ def _checkin_schedule_payload() -> dict:
     }
     return {
         "success": True,
-        "enabled": CHECKIN_SCHEDULE_ENABLED,
+        "enabled": bool(_effective_checkin_schedule_settings().get("enabled")),
         "date": plan.get("date"),
         "window_start": plan.get("window_start"),
         "window_end": plan.get("window_end"),
@@ -14200,18 +14422,97 @@ def _checkin_schedule_payload() -> dict:
     }
 
 
+def _checkin_schedule_account_count() -> int:
+    """Count current accounts for schedule-feasibility display and validation."""
+
+    return len(auth.get_accounts_raw())
+
+
+def _checkin_schedule_settings_payload(settings: dict | None = None) -> dict:
+    """Return the minute-based schedule controls used by the panel API."""
+
+    current = settings or _effective_checkin_schedule_settings()
+    start_min = _checkin_clock_minutes(current.get("window_start"))
+    window_minutes = int(current.get("window_minutes"))
+    account_count = _checkin_schedule_account_count()
+    maximum_seconds, effective_seconds = _checkin_effective_gap_seconds(
+        account_count,
+        window_minutes,
+        float(current.get("min_gap_minutes") or 0) * 60,
+    )
+    def _minutes(value: float) -> int | float:
+        rounded = round(value, 10)
+        return int(rounded) if rounded.is_integer() else rounded
+
+    return {
+        "success": True,
+        "enabled": bool(current.get("enabled")),
+        "source": current.get("source") or "env",
+        "window_start": _checkin_clock_text(start_min),
+        "window_minutes": window_minutes,
+        "window_end": _checkin_clock_text(start_min + window_minutes),
+        "min_gap_minutes": current.get("min_gap_minutes"),
+        # The panel's minute hint intentionally floors a fractional maximum;
+        # POST validation below still compares the exact seconds value.
+        "max_gap_minutes": (
+            math.floor(maximum_seconds / 60) if maximum_seconds is not None else None
+        ),
+        "effective_gap_minutes": _minutes(effective_seconds / 60),
+    }
+
+
+def _parse_checkin_schedule_submission(body: dict) -> tuple[bool, str, int, int | float]:
+    """Validate the POST body before any setting or plan is changed."""
+
+    required = ("enabled", "window_start", "window_minutes", "min_gap_minutes")
+    missing = next((field for field in required if field not in body), None)
+    if missing:
+        raise ValueError(f"{missing} is required")
+    window_start = auth.normalize_checkin_time(body.get("window_start"))
+    window_minutes = body.get("window_minutes")
+    if isinstance(window_minutes, bool) or not isinstance(window_minutes, int) or window_minutes <= 0:
+        raise ValueError("window_minutes must be an integer greater than 0")
+    start_min = _checkin_clock_minutes(window_start)
+    if start_min + window_minutes > 24 * 60:
+        raise ValueError("window must not pass 24:00")
+    raw_gap = body.get("min_gap_minutes")
+    if isinstance(raw_gap, bool):
+        raise ValueError("min_gap_minutes must be a number greater than or equal to 0")
+    try:
+        min_gap_minutes = float(raw_gap)
+    except (TypeError, ValueError):
+        raise ValueError("min_gap_minutes must be a number greater than or equal to 0") from None
+    if not math.isfinite(min_gap_minutes) or min_gap_minutes < 0:
+        raise ValueError("min_gap_minutes must be a number greater than or equal to 0")
+    if min_gap_minutes.is_integer():
+        min_gap_minutes = int(min_gap_minutes)
+    return _truthy(body.get("enabled")), window_start, window_minutes, min_gap_minutes
+
+
+def _regenerate_checkin_schedule_plan() -> dict:
+    """Replace today's cached plan after a successful settings save."""
+
+    global _CHECKIN_PLAN_CACHE
+    current = datetime.now(_CHECKIN_TIMEZONE)
+    settings = _effective_checkin_schedule_settings()
+    with _CHECKIN_PLAN_LOCK:
+        _CHECKIN_PLAN_CACHE = None
+        if not settings.get("enabled"):
+            return _empty_checkin_plan(current)
+        plan = _build_checkin_plan(_scheduled_checkin_account_ids(), current)
+        _save_checkin_plan(plan)
+        return plan
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _CHECKIN_SCHEDULE_TASK
     await init_app()
     web_reaper = asyncio.create_task(_web_reaper_loop())
     terminal_reaper = asyncio.create_task(_terminal_session_reaper_loop())
     checkin_retry = asyncio.create_task(_checkin_auto_retry_loop())
     auto_checkin = asyncio.create_task(_auto_checkin_loop())
-    checkin_schedule = (
-        asyncio.create_task(_checkin_schedule_loop())
-        if CHECKIN_SCHEDULE_ENABLED
-        else None
-    )
+    _ensure_checkin_schedule_loop()
     usage_enrichment = asyncio.create_task(_usage_enrichment_loop())
     credit_reconcile = asyncio.create_task(_credit_reconcile_loop())
     try:
@@ -14225,11 +14526,14 @@ async def lifespan(app: FastAPI):
             usage_enrichment,
             credit_reconcile,
         )
-        if checkin_schedule is not None:
-            tasks = (*tasks, checkin_schedule)
+        active_schedule_task = _CHECKIN_SCHEDULE_TASK
+        if active_schedule_task is not None:
+            tasks = (*tasks, active_schedule_task)
         for reaper in tasks:
             reaper.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if _CHECKIN_SCHEDULE_TASK is active_schedule_task:
+            _CHECKIN_SCHEDULE_TASK = None
         await _cancel_usage_tasks()
 
 
@@ -14379,6 +14683,16 @@ async def auth_middleware(request: Request, call_next):
     # ``/api/accounts`` public-prefix exemption below.  It uses exactly the
     # relay API-key parsing accepted by normal protected endpoints.
     if request.url.path == "/api/accounts/proxy":
+        if supplied_api_key() not in API_KEYS:
+            return reject_invalid_api_key()
+        return await call_next(request)
+    # ``/api/checkin`` is historically a public prefix.  The schedule
+    # settings reader remains public, but its mutation endpoint must use the
+    # normal relay management key just like the per-account proxy mutation.
+    if (
+        request.url.path == "/api/checkin/schedule/settings"
+        and request.method == "POST"
+    ):
         if supplied_api_key() not in API_KEYS:
             return reject_invalid_api_key()
         return await call_next(request)
@@ -16411,6 +16725,52 @@ async def api_get_auto_checkin():
 async def api_get_checkin_schedule():
     """Today's randomized per-account check-in schedule (read-only)."""
     return JSONResponse(_checkin_schedule_payload(), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/checkin/schedule/settings")
+async def api_get_checkin_schedule_settings():
+    """Public, minute-based randomized-schedule settings for the console."""
+    return JSONResponse(
+        _checkin_schedule_settings_payload(), headers={"Cache-Control": "no-store"}
+    )
+
+
+@app.post("/api/checkin/schedule/settings")
+async def api_set_checkin_schedule_settings(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"success": False, "error": "JSON body must be an object"}, status_code=400)
+    try:
+        enabled, window_start, window_minutes, min_gap_minutes = (
+            _parse_checkin_schedule_submission(body)
+        )
+        maximum_seconds = _checkin_max_feasible_gap_seconds(
+            _checkin_schedule_account_count(), window_minutes
+        )
+        if maximum_seconds is not None and min_gap_minutes * 60 > maximum_seconds:
+            maximum_minutes = maximum_seconds / 60
+            raise ValueError(
+                "min_gap_minutes exceeds the maximum allowed value of "
+                f"{maximum_minutes:.2f} minutes for the current accounts and window"
+            )
+        settings = auth.set_checkin_schedule_settings(
+            enabled, window_start, window_minutes, min_gap_minutes
+        )
+    except ValueError as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+    _regenerate_checkin_schedule_plan()
+    # During a normal ASGI request a loop is running and a just-enabled
+    # schedule needs its worker immediately.  Direct handler tests and other
+    # synchronous callers have no running loop, where persistence alone is
+    # still the correct successful save behavior.
+    try:
+        _ensure_checkin_schedule_loop()
+    except RuntimeError:
+        pass
+    return JSONResponse(_checkin_schedule_settings_payload(settings))
 
 
 @app.post("/api/auto-checkin")

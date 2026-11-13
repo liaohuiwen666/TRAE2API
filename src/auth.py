@@ -11,6 +11,7 @@ auth.py - 认证管理
 import base64
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -2386,6 +2387,18 @@ _AUTO_CHECKIN_ENV = 'TRAE_AUTO_CHECKIN'
 _AUTO_CHECKIN_TIME_ENV = 'TRAE_AUTO_CHECKIN_TIME'
 _AUTO_CHECKIN_DEFAULT_TIME = '08:30'
 
+# Randomized check-in scheduling is deliberately separate from the legacy
+# fixed-time auto check-in settings above.  These names mirror the existing
+# environment configuration so a console setting also survives deployments
+# which bootstrap from .env.
+_CHECKIN_SCHEDULE_ENABLED_ENV = 'TRAE_CHECKIN_SCHEDULE_ENABLED'
+_CHECKIN_WINDOW_START_ENV = 'TRAE_CHECKIN_WINDOW_START'
+_CHECKIN_WINDOW_END_ENV = 'TRAE_CHECKIN_WINDOW_END'
+_CHECKIN_MIN_GAP_SECONDS_ENV = 'TRAE_CHECKIN_MIN_GAP_SECONDS'
+_CHECKIN_SCHEDULE_DEFAULT_START = '06:00'
+_CHECKIN_SCHEDULE_DEFAULT_WINDOW_MINUTES = 900
+_CHECKIN_SCHEDULE_DEFAULT_MIN_GAP_MINUTES = 10
+
 
 def normalize_checkin_time(value) -> str:
     """Validate an HH:MM (24h) string; raise ValueError when malformed."""
@@ -2427,6 +2440,146 @@ def set_auto_checkin_settings(enabled: bool, time_text=None) -> dict:
     os.environ[_AUTO_CHECKIN_TIME_ENV] = normalized
     _write_env_values({_AUTO_CHECKIN_ENV: '1' if enabled else '0', _AUTO_CHECKIN_TIME_ENV: normalized})
     return get_auto_checkin_settings()
+
+
+def _checkin_time_minutes(value, *, allow_24_end: bool = False) -> int:
+    """Turn a schedule time into minutes after midnight.
+
+    ``24:00`` is only valid for a derived window end.  It is not a valid
+    start time and therefore remains rejected by ``normalize_checkin_time``.
+    """
+
+    text = str(value or '').strip()
+    if allow_24_end and text == '24:00':
+        return 24 * 60
+    normalized = normalize_checkin_time(text)
+    hour, minute = (int(part) for part in normalized.split(':', 1))
+    return hour * 60 + minute
+
+
+def _checkin_minutes_text(minutes: int) -> str:
+    """Format a validated minute offset, including the valid end ``24:00``."""
+
+    return f'{minutes // 60:02d}:{minutes % 60:02d}'
+
+
+def _normalize_schedule_window_minutes(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError('window_minutes must be an integer greater than 0')
+    return value
+
+
+def _normalize_schedule_gap_minutes(value) -> int | float:
+    if isinstance(value, bool):
+        raise ValueError('min_gap_minutes must be a number greater than or equal to 0')
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        raise ValueError('min_gap_minutes must be a number greater than or equal to 0') from None
+    if not math.isfinite(normalized) or normalized < 0:
+        raise ValueError('min_gap_minutes must be a number greater than or equal to 0')
+    return int(normalized) if normalized.is_integer() else normalized
+
+
+def _checkin_schedule_env_settings() -> dict:
+    """Read the legacy environment form when no console setting was saved."""
+
+    try:
+        start = normalize_checkin_time(
+            os.environ.get(_CHECKIN_WINDOW_START_ENV) or _CHECKIN_SCHEDULE_DEFAULT_START
+        )
+        start_minutes = _checkin_time_minutes(start)
+        end_minutes = _checkin_time_minutes(
+            os.environ.get(_CHECKIN_WINDOW_END_ENV) or '21:00', allow_24_end=True
+        )
+        window_minutes = end_minutes - start_minutes
+        if window_minutes <= 0:
+            raise ValueError('end must be after start')
+    except ValueError:
+        start = _CHECKIN_SCHEDULE_DEFAULT_START
+        window_minutes = _CHECKIN_SCHEDULE_DEFAULT_WINDOW_MINUTES
+
+    try:
+        seconds = float(
+            os.environ.get(_CHECKIN_MIN_GAP_SECONDS_ENV)
+            or _CHECKIN_SCHEDULE_DEFAULT_MIN_GAP_MINUTES * 60
+        )
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError('invalid gap')
+        min_gap_minutes = seconds / 60
+        if min_gap_minutes.is_integer():
+            min_gap_minutes = int(min_gap_minutes)
+    except (TypeError, ValueError):
+        min_gap_minutes = _CHECKIN_SCHEDULE_DEFAULT_MIN_GAP_MINUTES
+
+    return {
+        'enabled': os.environ.get(_CHECKIN_SCHEDULE_ENABLED_ENV, '').strip().lower()
+        in ('1', 'true', 'yes', 'on'),
+        'window_start': start,
+        'window_minutes': window_minutes,
+        'min_gap_minutes': min_gap_minutes,
+        'source': 'env',
+    }
+
+
+def get_checkin_schedule_settings() -> dict:
+    """Return persisted randomized-schedule settings or their env fallback."""
+
+    with _STORE_LOCK:
+        saved = _settings.get('checkin_schedule')
+    if not isinstance(saved, dict):
+        return _checkin_schedule_env_settings()
+    try:
+        window_start = normalize_checkin_time(saved.get('window_start'))
+        window_minutes = _normalize_schedule_window_minutes(saved.get('window_minutes'))
+        start_minutes = _checkin_time_minutes(window_start)
+        if start_minutes + window_minutes > 24 * 60:
+            raise ValueError('window must not pass 24:00')
+        min_gap_minutes = _normalize_schedule_gap_minutes(saved.get('min_gap_minutes'))
+    except ValueError:
+        window_start = _CHECKIN_SCHEDULE_DEFAULT_START
+        window_minutes = _CHECKIN_SCHEDULE_DEFAULT_WINDOW_MINUTES
+        min_gap_minutes = _CHECKIN_SCHEDULE_DEFAULT_MIN_GAP_MINUTES
+    return {
+        'enabled': bool(saved.get('enabled')),
+        'window_start': window_start,
+        'window_minutes': window_minutes,
+        'min_gap_minutes': min_gap_minutes,
+        'source': 'console',
+    }
+
+
+def set_checkin_schedule_settings(
+    enabled: bool, window_start, window_minutes, min_gap_minutes
+) -> dict:
+    """Persist the randomized-schedule controls and mirror their env form."""
+
+    normalized_start = normalize_checkin_time(window_start)
+    normalized_window = _normalize_schedule_window_minutes(window_minutes)
+    start_minutes = _checkin_time_minutes(normalized_start)
+    end_minutes = start_minutes + normalized_window
+    if end_minutes > 24 * 60:
+        raise ValueError('window must not pass 24:00')
+    normalized_gap = _normalize_schedule_gap_minutes(min_gap_minutes)
+
+    with _STORE_LOCK:
+        _settings['checkin_schedule'] = {
+            'enabled': bool(enabled),
+            'window_start': normalized_start,
+            'window_minutes': normalized_window,
+            'min_gap_minutes': normalized_gap,
+        }
+        _save_accounts()
+
+    values = {
+        _CHECKIN_SCHEDULE_ENABLED_ENV: '1' if enabled else '0',
+        _CHECKIN_WINDOW_START_ENV: normalized_start,
+        _CHECKIN_WINDOW_END_ENV: _checkin_minutes_text(end_minutes),
+        _CHECKIN_MIN_GAP_SECONDS_ENV: format(float(normalized_gap) * 60, 'g'),
+    }
+    os.environ.update(values)
+    _write_env_values(values)
+    return get_checkin_schedule_settings()
 
 
 def set_polling_mode(mode: str) -> None:

@@ -4,9 +4,13 @@
 
 Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通道包装成 OpenAI 兼容 API（Chat Completions + Responses），支持调用方工具调用、thinking 分离输出、思考强度映射、多账号并发轮询、每日签到和积分消费记录，可直接接入 Codex、new-api 和各类 OpenAI SDK。
 
-**独立版本 v1.1.0，基于 [autumnsentiment/trae2api-cn](https://github.com/autumnsentiment/trae2api-cn)（MIT）二次开发，新增随机签到与分账号代理（见下）。**
+**独立版本 v1.2.0，基于 [autumnsentiment/trae2api-cn](https://github.com/autumnsentiment/trae2api-cn)（MIT）二次开发，新增随机签到面板设置与分账号代理（见下）。**
 
 **仅供学习使用。请勿用于商业用途。**
+
+## 1.2.0 新增
+
+- **随机签到面板设置**：控制台可直接开关随机签到，并设置窗口开始时间、窗口时长（分钟）和账号间最小间隔（分钟）。结束时间由开始时间和时长自动推导；面板会显示当前账号数下可用的最大间隔，保存时拒绝无法放入窗口的间隔配置。设置持久化在账号数据中，并同步到对应的环境变量。
 
 ## 1.1.0 新增
 
