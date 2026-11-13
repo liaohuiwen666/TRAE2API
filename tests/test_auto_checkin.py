@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -109,6 +110,69 @@ class AutoCheckinScheduleTests(unittest.TestCase):
         ):
             self.assertFalse(main_module._auto_checkin_due(settings, after))
             self.assertIsNone(main_module._auto_checkin_next_run(settings, after))
+
+    def test_fixed_toggle_greyed_out_when_random_schedule_enabled(self):
+        # 1.3.0.5: while the randomized schedule owns check-in the fixed
+        # toggle and time field render disabled, and the pill reads as
+        # taken over.  (1.3.0.4 only changed the pill text server-side;
+        # the background refresh overwrote it, so the payload now carries
+        # the flag and renderAutoCheckin re-applies the same state.)
+        toggle_re = re.compile(r'<input[^>]*id="auto-checkin-toggle"[^>]*>')
+        time_re = re.compile(r'<input[^>]*id="auto-checkin-time"[^>]*>')
+        standalone_disabled = re.compile(r"\sdisabled(?=\s|>)")
+        with (
+            patch.object(
+                auth,
+                "get_auto_checkin_settings",
+                return_value={"enabled": True, "time": "08:30"},
+            ),
+            patch.object(
+                main_module,
+                "_effective_checkin_schedule_settings",
+                return_value={"enabled": True},
+            ),
+            patch.object(main_module, "_AUTO_CHECKIN_STATE", _fresh_state()),
+        ):
+            html = main_module._web_login_html()
+            toggle = toggle_re.search(html).group(0)
+            time_input = time_re.search(html).group(0)
+            self.assertRegex(toggle, standalone_disabled)
+            self.assertRegex(time_input, standalone_disabled)
+            self.assertIn(
+                'id="auto-checkin-state" class="state-pill">随机签到已接管</span>',
+                html,
+            )
+            self.assertTrue(main_module._auto_checkin_payload()["random_schedule_enabled"])
+
+    def test_fixed_toggle_interactive_when_random_schedule_off(self):
+        toggle_re = re.compile(r'<input[^>]*id="auto-checkin-toggle"[^>]*>')
+        time_re = re.compile(r'<input[^>]*id="auto-checkin-time"[^>]*>')
+        standalone_disabled = re.compile(r"\sdisabled(?=\s|>)")
+        with (
+            patch.object(
+                auth,
+                "get_auto_checkin_settings",
+                return_value={"enabled": True, "time": "08:30"},
+            ),
+            patch.object(
+                main_module,
+                "_effective_checkin_schedule_settings",
+                return_value={"enabled": False},
+            ),
+            patch.object(main_module, "_AUTO_CHECKIN_STATE", _fresh_state()),
+        ):
+            html = main_module._web_login_html()
+            toggle = toggle_re.search(html).group(0)
+            time_input = time_re.search(html).group(0)
+            self.assertNotRegex(toggle, standalone_disabled)
+            self.assertNotRegex(time_input, standalone_disabled)
+            self.assertIn(
+                'id="auto-checkin-state" class="state-pill on">每天 08:30 自动签到</span>',
+                html,
+            )
+            self.assertFalse(
+                main_module._auto_checkin_payload()["random_schedule_enabled"]
+            )
 
 
 class AutoCheckinCycleTests(unittest.IsolatedAsyncioTestCase):

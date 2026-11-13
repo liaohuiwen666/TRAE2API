@@ -1318,7 +1318,7 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
-APP_VERSION = "1.3.0.4"
+APP_VERSION = "1.3.0.5"
 
 # Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
 _LUCIDE_ICONS = {
@@ -1701,6 +1701,12 @@ a { color: var(--accent); }
 .switch input:checked + .track { background: var(--accent); }
 .switch input:checked + .track::after { transform: translateX(16px); background: var(--on-accent); }
 .switch input:focus-visible + .track { outline: 2px solid var(--edge); outline-offset: 2px; }
+/* A switch locked by another feature (fixed check-in superseded by the
+   randomized schedule) reads grey and unclickable, not merely dimmed. */
+#auto-checkin-toggle:disabled { cursor: not-allowed; }
+#auto-checkin-toggle:disabled + .track { background: var(--line-strong); opacity: .55; }
+#auto-checkin-toggle:disabled + .track::after { background: var(--knob); }
+.control:disabled { background: var(--surface-2); color: var(--faint); cursor: not-allowed; opacity: .72; -webkit-text-fill-color: var(--faint); }
 
 /* Segmented control */
 .segmented { display: inline-flex; padding: 2px; border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--frame); }
@@ -2355,6 +2361,14 @@ def _web_login_html() -> str:
         if auto_checkin.get('enabled') and random_schedule_on
         else f"每天 {auto_checkin_time} 自动签到" if auto_checkin.get('enabled') else '已关闭'
     )
+    # The randomized schedule owns check-in while it is on: the fixed
+    # toggle and time field render disabled so the section reads as taken
+    # over, not merely idle.  Rendered server-side (as with the endpoint
+    # lock) so there is no interactive window before JS runs; the
+    # background refresh re-applies the same state in renderAutoCheckin.
+    auto_checkin_disabled_attr = (
+        ' disabled aria-disabled="true"' if random_schedule_on else ' aria-disabled="false"'
+    )
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -2553,12 +2567,12 @@ def _web_login_html() -> str:
   <div class="switch-row">
     <div class="switch-text"><strong>定时签到</strong><span>每天按设定时间依次签到所有账号，已签到账号自动跳过</span></div>
     <label class="switch" title="启用定时签到">
-      <input type="checkbox" id="auto-checkin-toggle" {auto_checkin_checked} onchange="markAutoCheckinDirty()" aria-label="启用定时签到"><span class="track"></span>
+      <input type="checkbox" id="auto-checkin-toggle" {auto_checkin_checked}{auto_checkin_disabled_attr} onchange="markAutoCheckinDirty()" aria-label="启用定时签到"><span class="track"></span>
     </label>
   </div>
   <div class="schedule-row">
     <label class="time-field" for="auto-checkin-time">每天（北京时间）
-      <input class="control" type="time" id="auto-checkin-time" value="{auto_checkin_time}" step="60" required oninput="markAutoCheckinDirty()">
+      <input class="control" type="time" id="auto-checkin-time" value="{auto_checkin_time}" step="60" required{auto_checkin_disabled_attr} oninput="markAutoCheckinDirty()">
     </label>
     <div class="toolbar">
       <button class="btn btn-primary btn-sm" id="auto-checkin-save-btn" onclick="saveAutoCheckin()" disabled>{ic['save']}保存</button>
@@ -4746,7 +4760,14 @@ function renderAutoCheckin(d){{
     if(toggle) toggle.checked=!!d.enabled;
     if(timeInput&&d.time) timeInput.value=d.time;
   }}
-  setStatePill('auto-checkin-state',d.running?'正在执行...':(d.enabled?('每天 '+d.time+' 自动签到'):'已关闭'),d.enabled||d.running);
+  // While the randomized schedule is on it owns check-in: the fixed
+  // section reads as taken over (grey pill + disabled toggle/time) and
+  // the background refresh must not overwrite that with the plain
+  // "每天 HH:MM 自动签到" state.
+  var superseded=!!(d.enabled&&d.random_schedule_enabled);
+  if(toggle) toggle.disabled=superseded;
+  if(timeInput) timeInput.disabled=superseded;
+  setStatePill('auto-checkin-state',d.running?'正在执行...':(superseded?'随机签到已接管':(d.enabled?('每天 '+d.time+' 自动签到'):'已关闭')),(d.enabled||d.running)&&!superseded);
   document.getElementById('auto-checkin-next').textContent=d.enabled?formatCheckinTime(d.next_run):'未启用';
   document.getElementById('auto-checkin-last').textContent=d.last_run_at
     ? formatCheckinTime(d.last_run_at)+(d.last_trigger==='manual'?'（手动）':'（定时）') : '-';
@@ -14763,6 +14784,13 @@ def _auto_checkin_payload() -> dict:
         "success": True,
         **settings,
         "timezone": "Asia/Shanghai",
+        # The console needs this to keep the fixed-check-in section showing
+        # as taken over after its background refresh re-renders the pill:
+        # without it renderAutoCheckin would overwrite "随机签到已接管"
+        # with "每天 HH:MM 自动签到" on every poll.
+        "random_schedule_enabled": bool(
+            _effective_checkin_schedule_settings().get("enabled")
+        ),
         "next_run": next_run.isoformat(timespec="minutes") if next_run else None,
         "running": bool(_AUTO_CHECKIN_STATE.get("running")),
         "last_run_at": (
